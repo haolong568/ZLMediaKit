@@ -10,12 +10,12 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
         with:
           ref: 79d795a767da85bbba821b871265fd87d853d808
 
       - name: 下载submodule源码
-        run: mv -Force .gitmodules_github .gitmodules && git submodule sync && git submodule update --init
+        run: git submodule sync && git submodule update --init
 
       - name: 配置 vcpkg
         uses: lukka/run-vcpkg@v7
