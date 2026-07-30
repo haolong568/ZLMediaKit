@@ -26,20 +26,19 @@ jobs:
       - name: 加载VS2022编译环境
         uses: ilammy/msvc-dev-cmd@v1
 
-      # 关键：不直接调用build_win.cmd，拆分脚本，手动下载openssl，规避脚本内下载失败
-      - name: 创建依赖目录
-        run: mkdir build;mkdir build/openssl
-
-      - name: 下载预编译OpenSSL（国内镜像备选，规避github raw访问失败）
+      - name: 创建依赖目录并下载OpenSSL
         run: |
+          mkdir build;mkdir build/openssl
           cd build/openssl
-          curl -L -o openssl.zip https://github.com/ZLMediaKit/ZLMediaKit/releases/download/openssl-windows/openssl-x64.zip
-          tar -xf openssl.zip
+          $ProgressPreference = 'SilentlyContinue'
+          $url = "https://github.com/ZLMediaKit/ZLMediaKit/releases/download/openssl-windows/openssl-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile openssl.zip -RetryCount 5 -RetryInterval 10
+          Expand-Archive -Path openssl.zip -DestinationPath . -Force
 
       - name: CMake配置
         run: |
           cmake -S . -B build `
-          -DCMAKE_PREFIX_PATH="${pwd}/build/openssl" `
+          -DCMAKE_PREFIX_PATH="$env:GITHUB_WORKSPACE/build/openssl" `
           -DENABLE_WEBRTC=OFF `
           -G "Visual Studio 17 2022" -A x64
 
