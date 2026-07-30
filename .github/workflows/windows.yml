@@ -6,59 +6,74 @@ concurrency:
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ master ]
 
 jobs:
-  build-windows:
+  build:
     runs-on: windows-2022
+    env:
+      VCPKG_VERSION: 2024.07.12
+      VCPKG_TRIPLET: x64-windows-static
+      ZLM_COMMIT: 79d795a767da85bbba821b871265fd87d853d808
+
     steps:
-      - name: 检出代码
+      - name: 检出源码
         uses: actions/checkout@v4
         with:
-          ref: 79d795a767da85bbba821b871265fd87d853d808
+          ref: ${{ env.ZLM_COMMIT }}
           submodules: false
 
       - name: 拉取子模块
-        run: git submodule sync && git submodule update --init --depth=1
-
-      - name: 配置 vcpkg
-        uses: lukka/run-vcpkg@v7
-        with:
-          vcpkgDirectory: ${{ github.workspace }}/vcpkg
-          vcpkgGitCommitId: '390c240f54d0e02c6490e86c42f4d40d449c47d7'
-          # 关键修复：使用vcpkgArguments，移除非法vcpkgJsonGlob
-          vcpkgArguments: >
-            openssl:x64-windows-static
-            libsrtp:x64-windows-static
-            usrsctp:x64-windows-static
-            ffmpeg:x64-windows-static
-
-      - name: CMake编译
-        uses: lukka/run-cmake@v3
-        with:
-          cmakeListsTxtPath: ${{ github.workspace }}/CMakeLists.txt
-          buildDirectory: ${{ github.workspace }}/build
-          cmakeAppendedArgs: >
-            -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
-            -DCMAKE_BUILD_TYPE=Release
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static
-            -DENABLE_WEBRTC=OFF
-          buildWithCMake: true
-
-      - name: 设置日期环境变量
         run: |
-          $dateString = Get-Date -Format "yyyy-MM-dd"
-          echo "BUILD_DATE=$dateString" >> $env:GITHUB_ENV
+          git submodule sync
+          git submodule update --init --depth=1
 
-      - name: 检索编译产物
-        run: Get-ChildItem ./build -Recurse -Include *.exe
+      - name: vcpkg 依赖缓存
+        uses: actions/cache@v4
+        id: vcpkg-cache
+        with:
+          path: |
+            vcpkg
+            !vcpkg/buildtrees
+            !vcpkg/downloads
+          key: ${{ runner.os }}-vcpkg-${{ env.VCPKG_VERSION }}-${{ env.VCPKG_TRIPLET }}-openssl
 
-      - name: 打包二进制
+      - name: 安装 vcpkg
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch ${{ env.VCPKG_VERSION }} https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: 安装编译依赖
+        run: |
+          .\vcpkg\vcpkg install `
+            openssl:${{ env.VCPKG_TRIPLET }} `
+            --recurse
+
+      - name: CMake 工程配置
+        run: |
+          cmake -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} `
+            -DENABLE_WEBRTC=OFF `
+            -G "Visual Studio 17 2022" -A x64
+
+      - name: 编译 Release 版本
+        run: cmake --build build --config Release --parallel
+
+      - name: 整理完整运行包
+        run: |
+          New-Item -ItemType Directory -Path release -Force
+          Copy-Item build/Release/*.exe release/
+          Copy-Item build/Release/*.dll release/ -ErrorAction SilentlyContinue
+          Copy-Item config.ini release/
+          Copy-Item default.pem release/
+          Copy-Item -Recurse www release/
+
+      - name: 打包输出产物
         uses: actions/upload-artifact@v4
         with:
-          name: ZLMediaKit-Win-x64-${{ env.BUILD_DATE }}
-          path: |
-            build/*.exe
-            build/*.dll
-            build/Release/*.exe
-            build/Release/*.dll
-          if-no-files-found: error
+          name: ZLMediaKit-Win-x64-${{ env.ZLM_COMMIT }}
+          path: release/*
+          retention-days: 30
