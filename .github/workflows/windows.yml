@@ -6,17 +6,12 @@ concurrency:
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ master ]
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-2022
     env:
-      VCPKG_VERSION: 2024.07.12
-      VCPKG_TRIPLET: x64-windows-static
       ZLM_COMMIT: 79d795a767da85bbba821b871265fd87d853d808
-
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
@@ -24,56 +19,32 @@ jobs:
           ref: ${{ env.ZLM_COMMIT }}
           submodules: false
 
-      - name: 拉取子模块
+      - name: 更新子模块
         run: |
           git submodule sync
           git submodule update --init --depth=1
 
-      - name: vcpkg 依赖缓存
-        uses: actions/cache@v4
-        id: vcpkg-cache
-        with:
-          path: |
-            vcpkg
-            !vcpkg/buildtrees
-            !vcpkg/downloads
-          key: ${{ runner.os }}-vcpkg-${{ env.VCPKG_VERSION }}-${{ env.VCPKG_TRIPLET }}-openssl
+      # 加载系统VS编译环境
+      - name: 加载 VS2022 环境
+        uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 安装 vcpkg
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      # 执行ZLMediaKit官方Windows编译脚本
+      - name: 执行编译
         run: |
-          git clone --depth=1 --branch ${{ env.VCPKG_VERSION }} https://github.com/microsoft/vcpkg.git
-          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          .\build_win.cmd
 
-      - name: 安装编译依赖
+      # 整理发布包
+      - name: 整理产物
         run: |
-          .\vcpkg\vcpkg install `
-            openssl:${{ env.VCPKG_TRIPLET }} `
-            --recurse
+          New-Item release -ItemType Directory -Force
+          Copy-Item release/* ./release/ -Recurse -Force
+          Copy-Item config.ini ./release/
+          Copy-Item default.pem ./release/
+          Copy-Item -Recurse www ./release/
 
-      - name: CMake 工程配置
-        run: |
-          cmake -B build `
-            -DCMAKE_TOOLCHAIN_FILE="$env:GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=${{ env.VCPKG_TRIPLET }} `
-            -DENABLE_WEBRTC=OFF `
-            -G "Visual Studio 17 2022" -A x64
-
-      - name: 编译 Release 版本
-        run: cmake --build build --config Release --parallel
-
-      - name: 整理完整运行包
-        run: |
-          New-Item -ItemType Directory -Path release -Force
-          Copy-Item build/Release/*.exe release/
-          Copy-Item build/Release/*.dll release/ -ErrorAction SilentlyContinue
-          Copy-Item config.ini release/
-          Copy-Item default.pem release/
-          Copy-Item -Recurse www release/
-
-      - name: 打包输出产物
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: ZLMediaKit-Win-x64-${{ env.ZLM_COMMIT }}
-          path: release/*
+          path: ./release
           retention-days: 30
