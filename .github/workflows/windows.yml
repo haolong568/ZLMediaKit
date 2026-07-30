@@ -5,10 +5,6 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
   workflow_dispatch:
 
 jobs:
@@ -29,7 +25,12 @@ jobs:
         with:
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
           vcpkgGitCommitId: '390c240f54d0e02c6490e86c42f4d40d449c47d7'
-          vcpkgJsonGlob: 'vcpkg.json'
+          # 关键修复：使用vcpkgArguments，移除非法vcpkgJsonGlob
+          vcpkgArguments: >
+            openssl:x64-windows-static
+            libsrtp:x64-windows-static
+            usrsctp:x64-windows-static
+            ffmpeg:x64-windows-static
 
       - name: CMake编译
         uses: lukka/run-cmake@v3
@@ -48,10 +49,10 @@ jobs:
           $dateString = Get-Date -Format "yyyy-MM-dd"
           echo "BUILD_DATE=$dateString" >> $env:GITHUB_ENV
 
-      - name: 打印构建目录（调试定位exe）
+      - name: 检索编译产物
         run: Get-ChildItem ./build -Recurse -Include *.exe
 
-      - name: 打包二进制产物
+      - name: 打包二进制
         uses: actions/upload-artifact@v4
         with:
           name: ZLMediaKit-Win-x64-${{ env.BUILD_DATE }}
