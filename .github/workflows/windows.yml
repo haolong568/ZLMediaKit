@@ -3,40 +3,37 @@ name: Windows
 on:
   push:
   pull_request:
-  workflow_dispatch
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
         with:
           ref: 79d795a767da85bbba821b871265fd87d853d808
-
-      - name: 下载submodule源码
-        run: mv -Force .gitmodules_github .gitmodules && git submodule sync && git submodule update --init
+          submodules: recursive
 
       - name: 配置 vcpkg
-        uses: lukka/run-vcpkg@v7
+        uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: '${{github.workspace}}/vcpkg'
+          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6'
           vcpkgTriplet: x64-windows-static
-          vcpkgGitCommitId: 'efcfaaf60d7ec57a159fc3110403d939bfb69729'
-          vcpkgArguments: 'openssl libsrtp[openssl] usrsctp'
+          vcpkgJsonGlob: '**/vcpkg.json'
 
       - name: 编译
-        uses: lukka/run-cmake@v3
+        uses: lukka/run-cmake@v10
         with:
-          useVcpkgToolchainFile: true
-          buildDirectory: '${{github.workspace}}/build'
-          cmakeAppendedArgs: ''
-          cmakeBuildType: 'Release'
+          configurePreset: 'win-x64-static-release'
+          buildPreset: 'win-x64-static-release'
 
       - name: 打包二进制
-        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
-          path: build/Release/*
+          path: |
+            build/win-x64-static-release/Release/*.exe
+            build/win-x64-static-release/Release/*.dll
           if-no-files-found: error
           retention-days: 90
