@@ -8,7 +8,6 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-
     steps:
       - uses: actions/checkout@v1
         with:
@@ -33,20 +32,11 @@ jobs:
           cmakeAppendedArgs: ''
           cmakeBuildType: 'Release'
 
-      - name: 设置环境变量
-        run: |
-          $dateString = Get-Date -Format "yyyy-MM-dd"
-          $branchRaw = $env:GITHUB_REF -replace "refs/heads/", ""
-          $branch = $branchRaw -replace '[\/?%*:|`<>]', '_'
-          echo "BRANCH=$branch" >> $env:GITHUB_ENV
-          echo "BRANCH2=$branchRaw" >> $env:GITHUB_ENV
-          echo "DATE=$dateString" >> $env:GITHUB_ENV
-
       - name: 打包二进制
         id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.workflow }}_${{ env.BRANCH }}_${{ env.DATE }}
+          name: Windows_${{ github.ref_name }}_${{ github.sha }}
           path: build/Release/*
           if-no-files-found: error
           retention-days: 90
