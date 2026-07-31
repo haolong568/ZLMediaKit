@@ -36,7 +36,7 @@ jobs:
       - name: 设置环境变量
         run: |
           $dateString = Get-Date -Format "yyyy-MM-dd"
-          $branch = $env:GITHUB_REF -replace "refs/heads/", "" -replace "[\\/\\?%\*:\|\`"<>]", "_"
+          $branch = $env:GITHUB_REF -replace "refs/heads/", "" -replace "[\\/\\?%\*:\|`<>]", "_"
           $branch2 = $env:GITHUB_REF -replace "refs/heads/", ""
           echo "BRANCH=$branch" >> $env:GITHUB_ENV
           echo "BRANCH2=$branch2" >> $env:GITHUB_ENV
