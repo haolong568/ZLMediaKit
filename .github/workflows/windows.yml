@@ -14,28 +14,23 @@ jobs:
           ref: 79d795a767da85bbba821b871265fd87d853d808
           submodules: recursive
 
-      - name: 配置 vcpkg
-        uses: lukka/run-vcpkg@v10
-        with:
-          vcpkgDirectory: '${{github.workspace}}/vcpkg'
-          vcpkgGitCommitId: 'efcfaaf60d7ec57a159fc3110403d939bfb69729'
-          vcpkgTriplet: x64-windows-static
-          appendedConfigFile: ''
-          # v10 仍支持直接传参，解决无 vcpkg.json 的旧版兼容问题
-          vcpkgConfigurationJsonGlob: ''
-          
-      - name: 安装依赖
-        run: |
-          ${{github.workspace}}/vcpkg/vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
+      - name: 安装 vcpkg 并编译依赖
         shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
+          cd ${{github.workspace}}/vcpkg
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          .\bootstrap-vcpkg.bat
+          .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
-      - name: 编译
-        uses: lukka/run-cmake@v10
-        with:
-          useVcpkgToolchainFile: true
-          buildDirectory: '${{github.workspace}}/build'
-          cmakeAppendedArgs: '-DCMAKE_BUILD_TYPE=Release'
-          cmakeBuildType: 'Release'
+      - name: CMake 配置与编译
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel
 
       - name: 打包二进制
         uses: actions/upload-artifact@v4
