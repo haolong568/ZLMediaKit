@@ -23,7 +23,7 @@ jobs:
           .\bootstrap-vcpkg.bat
           .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
-      - name: CMake 配置与编译
+      - name: CMake 配置与显式编译 MediaServer
         shell: pwsh
         run: |
           cmake -B build -S . `
@@ -33,10 +33,21 @@ jobs:
             -DENABLE_EXAMPLES=ON `
             -DBUILD_TESTING=OFF
           
-          Write-Host "=== 可用构建目标（含exe/MediaServer）==="
-          cmake --build build --target help | Select-String -Pattern "exe|MediaServer"
+          Write-Host "=== 确认可用目标 ==="
+          cmake --build build --target help | Select-String -Pattern "MediaServer"
           
-          cmake --build build --config Release --parallel
+          # ⚠️ 关键修复：不再使用 --parallel 全量构建，显式指定 MediaServer 目标
+          Write-Host "=== 开始显式编译 MediaServer ==="
+          cmake --build build --config Release --target MediaServer
+          
+          # 编译后立即校验，避免无效等待
+          $exePath = Get-ChildItem -Path build -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exePath) {
+            Write-Host "=== 构建目录完整结构（用于排查）==="
+            Get-ChildItem -Path build -Recurse -Include *.exe,*.lib,*.dll | Select-Object FullName
+            throw "编译完成但未找到 MediaServer.exe，请检查上方编译日志是否有链接错误"
+          }
+          Write-Host "✅ MediaServer.exe 已生成: $($exePath.FullName)"
 
       - name: 收集构建产物到统一目录
         shell: pwsh
@@ -50,7 +61,7 @@ jobs:
           Get-ChildItem dist | Select-Object Name, Length
           
           if ($exeCount -eq 0) { 
-            throw "未找到任何 .exe 文件，请检查上方 '可用构建目标' 日志确认目标名称，或当前 commit 不支持 Windows 主程序构建" 
+            throw "产物收集失败：dist 目录中无 .exe 文件" 
           }
 
       - name: 打包二进制
