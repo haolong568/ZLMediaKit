@@ -29,7 +29,13 @@ jobs:
           cmake -B build -S . `
             -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static `
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release `
+            -DENABLE_EXAMPLES=ON `
+            -DBUILD_TESTING=OFF
+          
+          Write-Host "=== 可用构建目标（含exe/MediaServer）==="
+          cmake --build build --target help | Select-String -Pattern "exe|MediaServer"
+          
           cmake --build build --config Release --parallel
 
       - name: 收集构建产物到统一目录
@@ -37,8 +43,15 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Get-ChildItem -Path build -Recurse -Include *.exe,*.dll | Copy-Item -Destination dist -Force
-          Write-Host "=== 已收集的产物 ==="
+          
+          $exeCount = (Get-ChildItem dist -Filter *.exe).Count
+          $dllCount = (Get-ChildItem dist -Filter *.dll).Count
+          Write-Host "=== 已收集产物：$exeCount 个 exe, $dllCount 个 dll ==="
           Get-ChildItem dist | Select-Object Name, Length
+          
+          if ($exeCount -eq 0) { 
+            throw "未找到任何 .exe 文件，请检查上方 '可用构建目标' 日志确认目标名称，或当前 commit 不支持 Windows 主程序构建" 
+          }
 
       - name: 打包二进制
         uses: actions/upload-artifact@v4
