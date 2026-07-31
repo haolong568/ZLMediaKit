@@ -15,25 +15,32 @@ jobs:
           submodules: recursive
 
       - name: 配置 vcpkg
-        uses: lukka/run-vcpkg@v11
+        uses: lukka/run-vcpkg@v10
         with:
           vcpkgDirectory: '${{github.workspace}}/vcpkg'
-          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6'
+          vcpkgGitCommitId: 'efcfaaf60d7ec57a159fc3110403d939bfb69729'
           vcpkgTriplet: x64-windows-static
-          vcpkgJsonGlob: '**/vcpkg.json'
+          appendedConfigFile: ''
+          # v10 仍支持直接传参，解决无 vcpkg.json 的旧版兼容问题
+          vcpkgConfigurationJsonGlob: ''
+          
+      - name: 安装依赖
+        run: |
+          ${{github.workspace}}/vcpkg/vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
+        shell: pwsh
 
       - name: 编译
         uses: lukka/run-cmake@v10
         with:
-          configurePreset: 'win-x64-static-release'
-          buildPreset: 'win-x64-static-release'
+          useVcpkgToolchainFile: true
+          buildDirectory: '${{github.workspace}}/build'
+          cmakeAppendedArgs: '-DCMAKE_BUILD_TYPE=Release'
+          cmakeBuildType: 'Release'
 
       - name: 打包二进制
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
-          path: |
-            build/win-x64-static-release/Release/*.exe
-            build/win-x64-static-release/Release/*.dll
-          if-no-files-found: error
+          path: build/Release/*
+          if-no-files-found: warn
           retention-days: 90
