@@ -32,10 +32,22 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release --parallel
 
+      - name: 检查构建产物（调试用）
+        shell: pwsh
+        run: |
+          Write-Host "=== 构建目录完整结构 ==="
+          Get-ChildItem -Path build -Recurse -Include *.exe,*.dll,*.lib | Select-Object FullName
+          Write-Host "========================"
+
       - name: 打包二进制
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
-          path: build/Release/*
-          if-no-files-found: warn
+          # ⚠️ 请先根据上一步调试日志确认实际路径，以下为旧版ZLMediaKit常见输出位置
+          path: |
+            build/bin/Release/*.exe
+            build/bin/Release/*.dll
+            build/Release/*.exe
+            build/Release/*.dll
+          if-no-files-found: error
           retention-days: 90
