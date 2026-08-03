@@ -23,9 +23,12 @@ jobs:
           .\bootstrap-vcpkg.bat
           .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
-      - name: CMake 配置与显式编译 MediaServer
+      - name: CMake 配置与强制编译 MediaServer
         shell: pwsh
         run: |
+          # ⚠️ 关键修复：每次运行前彻底清理 build 目录，避免缓存导致目标被跳过
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          
           cmake -B build -S . `
             -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static `
@@ -33,21 +36,23 @@ jobs:
             -DENABLE_EXAMPLES=ON `
             -DBUILD_TESTING=OFF
           
-          Write-Host "=== 确认可用目标 ==="
-          cmake --build build --target help | Select-String -Pattern "MediaServer"
+          Write-Host "=== 确认 MediaServer 目标存在 ==="
+          $targetExists = cmake --build build --target help | Select-String -Pattern "^\s*MediaServer\s*$"
+          if (-not $targetExists) { throw "MediaServer 目标不存在，请检查 ENABLE_EXAMPLES 是否生效" }
           
-          # ⚠️ 关键修复：不再使用 --parallel 全量构建，显式指定 MediaServer 目标
-          Write-Host "=== 开始显式编译 MediaServer ==="
-          cmake --build build --config Release --target MediaServer
+          # ⚠️ 强制重建：使用 --clean-first 确保不跳过任何步骤
+          Write-Host "=== 强制重建 MediaServer ==="
+          cmake --build build --config Release --target MediaServer --clean-first
           
-          # 编译后立即校验，避免无效等待
-          $exePath = Get-ChildItem -Path build -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $exePath) {
-            Write-Host "=== 构建目录完整结构（用于排查）==="
-            Get-ChildItem -Path build -Recurse -Include *.exe,*.lib,*.dll | Select-Object FullName
-            throw "编译完成但未找到 MediaServer.exe，请检查上方编译日志是否有链接错误"
+          # 编译后立即校验
+          $exeFiles = Get-ChildItem -Path build -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue
+          if ($exeFiles.Count -eq 0) {
+            Write-Host "=== 构建目录所有二进制文件（用于排查）==="
+            Get-ChildItem -Path build -Recurse -Include *.exe,*.lib,*.dll,*.obj | Select-Object FullName, Length
+            throw "编译完成但未找到任何 .exe 文件，请检查上方编译日志是否有静默失败"
           }
-          Write-Host "✅ MediaServer.exe 已生成: $($exePath.FullName)"
+          Write-Host "✅ 已生成的可执行文件:"
+          $exeFiles | ForEach-Object { Write-Host "  $($_.FullName) ($([math]::Round($_.Length/1KB, 2)) KB)" }
 
       - name: 收集构建产物到统一目录
         shell: pwsh
@@ -58,7 +63,7 @@ jobs:
           $exeCount = (Get-ChildItem dist -Filter *.exe).Count
           $dllCount = (Get-ChildItem dist -Filter *.dll).Count
           Write-Host "=== 已收集产物：$exeCount 个 exe, $dllCount 个 dll ==="
-          Get-ChildItem dist | Select-Object Name, Length
+          Get-ChildItem dist | Select-Object Name, @{N='Size(KB)';E={[math]::Round($_.Length/1KB,2)}}
           
           if ($exeCount -eq 0) { 
             throw "产物收集失败：dist 目录中无 .exe 文件" 
