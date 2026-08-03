@@ -23,57 +23,60 @@ jobs:
           .\bootstrap-vcpkg.bat
           .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
-      - name: CMake 配置与强制编译 MediaServer
+      - name: CMake 配置
         shell: pwsh
         run: |
-          # 彻底清理构建缓存
-          if (Test-Path build) { Remove-Item -Recurse -Force build }
-          
           cmake -B build -S . `
             -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DENABLE_EXAMPLES=ON `
-            -DENABLE_MEDIA_SERVER=ON `
-            -DBUILD_TESTING=OFF `
-            -DENABLE_OPENSSL=ON
+            -DCMAKE_BUILD_TYPE=Release
           
-          Write-Host "=== 确认 MediaServer 目标存在 ==="
-          $targetExists = cmake --build build --target help | Select-String -Pattern "^\s*MediaServer\s*$"
-          if (-not $targetExists) { 
-            Write-Host "可用目标列表:"
-            cmake --build build --target help | Select-String -Pattern "exe|server|media" -CaseSensitive:$false
-            throw "MediaServer 目标不存在，请检查上方可用目标列表" 
-          }
-          
-          # 强制重建
-          Write-Host "=== 强制重建 MediaServer ==="
-          cmake --build build --config Release --target MediaServer --clean-first
-          
-          # 编译后立即校验
-          $exeFiles = Get-ChildItem -Path build -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue
-          if ($exeFiles.Count -eq 0) {
-            Write-Host "=== 构建目录所有二进制文件 ==="
-            Get-ChildItem -Path build -Recurse -Include *.exe,*.lib,*.dll,*.obj | Select-Object FullName, Length
-            throw "编译完成但未找到任何 .exe 文件，请检查上方编译日志是否有静默失败"
-          }
-          Write-Host "✅ 已生成的可执行文件:"
-          $exeFiles | ForEach-Object { Write-Host "  $($_.FullName) ($([math]::Round($_.Length/1KB, 2)) KB)" }
+          Write-Host "=== CMakeCache 输出目录相关配置 ==="
+          Get-Content build/CMakeCache.txt | Select-String -Pattern "OUTPUT"
 
-      - name: 收集构建产物到统一目录
+      - name: 编译 MediaServer
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Get-ChildItem -Path build -Recurse -Include *.exe,*.dll | Copy-Item -Destination dist -Force
-          
-          $exeCount = (Get-ChildItem dist -Filter *.exe).Count
-          $dllCount = (Get-ChildItem dist -Filter *.dll).Count
-          Write-Host "=== 已收集产物：$exeCount 个 exe, $dllCount 个 dll ==="
-          Get-ChildItem dist | Select-Object Name, @{N='Size(KB)';E={[math]::Round($_.Length/1KB,2)}}
-          
-          if ($exeCount -eq 0) { 
-            throw "产物收集失败：dist 目录中无 .exe 文件" 
+          # 关键修复：VS生成器下 --target help 不输出目标列表，改用 vcxproj 文件判断
+          if (-not (Test-Path build/server/MediaServer.vcxproj)) {
+            Write-Host "=== build 下所有 vcxproj（用于定位真实目标工程）==="
+            Get-ChildItem -Path build -Recurse -Filter *.vcxproj | Select-Object FullName
+            throw "未找到 build/server/MediaServer.vcxproj"
           }
+          
+          Write-Host "=== 开始编译 MediaServer ==="
+          cmake --build build --config Release --target MediaServer --parallel 4
+
+      - name: 全工作区定位并收集 MediaServer.exe
+        shell: pwsh
+        run: |
+          # 关键修复：旧版CMake把exe输出到build之外，因此搜索整个工作区而非仅build
+          Write-Host "=== 全工作区查找 MediaServer.exe ==="
+          $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
+          
+          if (-not $found) {
+            Write-Host "=== 未找到，列出工作区所有非vcpkg的exe ==="
+            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\vcpkg\\' } |
+              Select-Object FullName
+            throw "整个工作区未找到 MediaServer.exe"
+          }
+          
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          foreach ($f in @($found)) {
+            Write-Host "收集: $($f.FullName) ($([math]::Round($f.Length/1KB,2)) KB)"
+            Copy-Item $f.FullName -Destination dist -Force
+            # 同目录下的 dll 一并收集（如有）
+            Get-ChildItem -Path $f.DirectoryName -Filter *.dll | Copy-Item -Destination dist -Force
+          }
+          
+          # 尽力附带配置文件
+          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ -Destination dist -Force; Write-Host "收集配置: $_" }
+          }
+          
+          Write-Host "=== dist 最终内容 ==="
+          Get-ChildItem dist | Select-Object Name, @{N='Size(KB)';E={[math]::Round($_.Length/1KB,2)}}
 
       - name: 打包二进制
         uses: actions/upload-artifact@v4
