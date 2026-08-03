@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 关键：发布 Release 需要写权限（默认 GITHUB_TOKEN 只读）
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
@@ -30,55 +34,109 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static `
             -DCMAKE_BUILD_TYPE=Release
-          
-          Write-Host "=== CMakeCache 输出目录相关配置 ==="
-          Get-Content build/CMakeCache.txt | Select-String -Pattern "OUTPUT"
 
       - name: 编译 MediaServer
         shell: pwsh
         run: |
-          # 关键修复：VS生成器下 --target help 不输出目标列表，改用 vcxproj 文件判断
           if (-not (Test-Path build/server/MediaServer.vcxproj)) {
-            Write-Host "=== build 下所有 vcxproj（用于定位真实目标工程）==="
             Get-ChildItem -Path build -Recurse -Filter *.vcxproj | Select-Object FullName
             throw "未找到 build/server/MediaServer.vcxproj"
           }
-          
-          Write-Host "=== 开始编译 MediaServer ==="
           cmake --build build --config Release --target MediaServer --parallel 4
 
-      - name: 全工作区定位并收集 MediaServer.exe
+      - name: 全工作区收集产物（exe + config + pem + www）
         shell: pwsh
         run: |
-          # 关键修复：旧版CMake把exe输出到build之外，因此搜索整个工作区而非仅build
-          Write-Host "=== 全工作区查找 MediaServer.exe ==="
-          $found = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
-          
-          if (-not $found) {
-            Write-Host "=== 未找到，列出工作区所有非vcpkg的exe ==="
-            Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -notmatch '\\vcpkg\\' } |
-              Select-Object FullName
-            throw "整个工作区未找到 MediaServer.exe"
-          }
-          
+          $ws = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          foreach ($f in @($found)) {
-            Write-Host "收集: $($f.FullName) ($([math]::Round($f.Length/1KB,2)) KB)"
-            Copy-Item $f.FullName -Destination dist -Force
-            # 同目录下的 dll 一并收集（如有）
-            Get-ChildItem -Path $f.DirectoryName -Filter *.dll | Copy-Item -Destination dist -Force
-          }
-          
-          # 尽力附带配置文件
-          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
-            if (Test-Path $_) { Copy-Item $_ -Destination dist -Force; Write-Host "收集配置: $_" }
-          }
-          
-          Write-Host "=== dist 最终内容 ==="
-          Get-ChildItem dist | Select-Object Name, @{N='Size(KB)';E={[math]::Round($_.Length/1KB,2)}}
 
-      - name: 打包二进制
+          # 1) 主程序
+          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
+          foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
+
+          # 2) 配置文件
+          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
+          }
+
+          # 3) default.pem：优先用仓库自带；没有则用 openssl 生成自签名证书
+          $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
+          if ($pem) {
+            Copy-Item $pem.FullName -Destination dist/default.pem -Force
+            Write-Host "收集证书: $($pem.FullName)"
+          } else {
+            Write-Host "仓库未自带 default.pem，尝试生成自签名证书..."
+            $opensslExe = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+            if (-not $opensslExe) {
+              $opensslExe = Get-ChildItem -Path "$ws/vcpkg/installed" -Recurse -Filter "openssl.exe" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1 -ExpandProperty FullName
+            }
+            if ($opensslExe) {
+              & $opensslExe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
+              Write-Host "已生成自签名 default.pem"
+            } else {
+              Write-Host "⚠ 未找到 openssl 工具，跳过证书生成（仅影响 https 端口，不影响使用）"
+            }
+          }
+
+          # 4) www 目录（旧版仓库可能叫 web）
+          $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
+                 Select-Object -First 1
+          if ($www) {
+            Copy-Item $www.FullName -Destination dist/www -Recurse -Force
+            Write-Host "收集网页目录: $($www.FullName)"
+          } else {
+            Write-Host "⚠ 仓库中未发现 www/web 目录（旧版本可能本来就没有，不影响核心功能）"
+          }
+
+          Write-Host "=== dist 最终内容 ==="
+          Get-ChildItem dist | Select-Object Name
+
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path upload | Out-Null
+          Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
+          Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
+
+      - name: 清理旧 Release 资产（滚动发布，保证链接不变）
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/latest-windows" -Headers $headers -SkipHttpErrorCheck
+          if ($rel -and $rel.assets) {
+            foreach ($asset in $rel.assets) {
+              Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$repo/releases/assets/$($asset.id)" -Headers $headers | Out-Null
+              Write-Host "已删除旧资产: $($asset.name)"
+            }
+          } else {
+            Write-Host "尚无旧 Release，跳过清理"
+          }
+
+      - name: 发布到 Releases
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: latest-windows
+          name: "ZLMediaKit Windows x64 最新构建"
+          body: |
+            自动滚动发布的 Windows x64 静态构建（每次成功构建自动替换）。
+            对应 commit: ${{ github.sha }}
+            包内含: MediaServer.exe / config.ini / default.pem / www(如有)
+          files: upload/ZLMediaKit-Windows-x64.zip
+          make_latest: true
+
+      - name: 打包二进制（Actions 产物备份）
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
