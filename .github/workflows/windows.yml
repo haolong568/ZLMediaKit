@@ -5,7 +5,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-# 关键：发布 Release 需要写权限（默认 GITHUB_TOKEN 只读）
+# 发布 Release 需要写权限
 permissions:
   contents: write
 
@@ -17,6 +17,10 @@ jobs:
         with:
           ref: 79d795a767da85bbba821b871265fd87d853d808
           submodules: recursive
+
+      - name: 记录实际编译的 commit
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "BUILT_SHA=$(git rev-parse HEAD)"
 
       - name: 安装 vcpkg 并编译依赖
         shell: pwsh
@@ -60,7 +64,7 @@ jobs:
             if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
           }
 
-          # 3) default.pem：优先用仓库自带；没有则用 openssl 生成自签名证书
+          # 3) default.pem：优先仓库自带，否则用 openssl 生成自签名证书
           $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
                  Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
           if ($pem) {
@@ -78,11 +82,11 @@ jobs:
               Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
               Write-Host "已生成自签名 default.pem"
             } else {
-              Write-Host "⚠ 未找到 openssl 工具，跳过证书生成（仅影响 https 端口，不影响使用）"
+              Write-Host "⚠ 未找到 openssl 工具，跳过证书生成（仅影响 https 端口）"
             }
           }
 
-          # 4) www 目录（旧版仓库可能叫 web）
+          # 4) www 目录（旧版可能叫 web）
           $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
                  Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
                  Select-Object -First 1
@@ -90,7 +94,7 @@ jobs:
             Copy-Item $www.FullName -Destination dist/www -Recurse -Force
             Write-Host "收集网页目录: $($www.FullName)"
           } else {
-            Write-Host "⚠ 仓库中未发现 www/web 目录（旧版本可能本来就没有，不影响核心功能）"
+            Write-Host "⚠ 仓库中未发现 www/web 目录（不影响核心功能）"
           }
 
           Write-Host "=== dist 最终内容 ==="
@@ -103,35 +107,18 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      - name: 清理旧 Release 资产（滚动发布，保证链接不变）
-        if: github.event_name != 'pull_request'
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $repo = "${{ github.repository }}"
-          $headers = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
-          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/latest-windows" -Headers $headers -SkipHttpErrorCheck
-          if ($rel -and $rel.assets) {
-            foreach ($asset in $rel.assets) {
-              Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$repo/releases/assets/$($asset.id)" -Headers $headers | Out-Null
-              Write-Host "已删除旧资产: $($asset.name)"
-            }
-          } else {
-            Write-Host "尚无旧 Release，跳过清理"
-          }
-
-      - name: 发布到 Releases
+      - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: latest-windows
-          name: "ZLMediaKit Windows x64 最新构建"
+          tag_name: win-${{ github.run_number }}
+          name: "ZLMediaKit Windows x64 #${{ github.run_number }}"
+          target_commitish: ${{ env.BUILT_SHA }}
           body: |
-            自动滚动发布的 Windows x64 静态构建（每次成功构建自动替换）。
-            对应 commit: ${{ github.sha }}
+            Windows x64 静态构建（历史版本全部保留，可回滚）。
+            实际编译 commit: ${{ env.BUILT_SHA }}
             包内含: MediaServer.exe / config.ini / default.pem / www(如有)
           files: upload/ZLMediaKit-Windows-x64.zip
           make_latest: true
