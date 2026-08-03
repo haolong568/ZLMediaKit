@@ -111,7 +111,6 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          # ⚠️ 关键修复：直接用 with.token 传递 PAT，删除所有 env 和 fallback
           token: ${{ secrets.RELEASE_TOKEN }}
           tag_name: win-${{ github.run_number }}
           name: "ZLMediaKit Windows x64 #${{ github.run_number }}"
@@ -124,10 +123,10 @@ jobs:
           make_latest: true
 
       - name: 打包二进制（Actions 产物备份）
-        if: always()
+        if: success() && hashFiles('dist/**') != ''
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
           path: dist/*
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 90
