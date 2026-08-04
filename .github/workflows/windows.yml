@@ -16,6 +16,7 @@ jobs:
         with:
           ref: 79d795a767da85bbba821b871265fd87d853d808
           submodules: recursive
+          fetch-depth: 0
 
       - name: 记录实际编译的 commit
         shell: pwsh
@@ -96,9 +97,9 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 终极方案：gh CLI + PAT + 显式错误处理
-      # 不使用任何第三方 Action，直接调用 GitHub CLI
-      # 通过 GH_TOKEN 环境变量注入 PAT，彻底绕过 GITHUB_TOKEN 的 Fork 限制
+      # ✅ 修复：不传 --target 参数（commit SHA 可能不在 Fork 仓库中，导致 PATCH 404）
+      #    commit 信息写在 Release body 里，用户一眼就能看到
+      #    使用 PAT 认证，绕过 GITHUB_TOKEN 的 Fork 限制
       - name: 发布到 Releases（更新 latest-windows）
         if: github.event_name != 'pull_request'
         env:
@@ -109,38 +110,32 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = "latest-windows"
           $title = "ZLMediaKit Windows x64 最新构建"
-          $body = "自动滚动发布的 Windows x64 静态构建。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
+          $body = "自动滚动发布的 Windows x64 静态构建（每次成功构建自动替换）。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
           $asset = "upload/ZLMediaKit-Windows-x64.zip"
 
           Write-Host "🔍 检查现有 Release: $tag"
           $exists = gh release view $tag --json tagName 2>$null
-          
+
           if ($LASTEXITCODE -eq 0) {
             Write-Host "🔄 更新现有 Release..."
-            gh release edit $tag `
-              --title $title `
-              --notes $body `
-              --target $env:BUILT_SHA
-            
+            # ⚠️ 关键修复：不传 --target，避免 404
+            gh release edit $tag --title $title --notes $body
             if ($LASTEXITCODE -ne 0) { throw "❌ 更新 Release 失败" }
-            
+
             Write-Host "🗑️ 删除旧附件..."
             gh release delete-asset $tag ZLMediaKit-Windows-x64.zip --yes 2>$null
-            
+
             Write-Host "📤 上传新附件..."
             gh release upload $tag $asset --clobber
             if ($LASTEXITCODE -ne 0) { throw "❌ 上传附件失败" }
           } else {
             Write-Host "✨ 创建新 Release..."
-            gh release create $tag $asset `
-              --title $title `
-              --notes $body `
-              --target $env:BUILT_SHA `
-              --latest
+            # 创建时也不传 --target
+            gh release create $tag $asset --title $title --notes $body --latest
             if ($LASTEXITCODE -ne 0) { throw "❌ 创建 Release 失败" }
           }
-          
-          Write-Host "✅ Release 发布成功: $tag → $env:BUILT_SHA"
+
+          Write-Host "✅ Release 发布成功: $tag → commit $env:BUILT_SHA"
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
