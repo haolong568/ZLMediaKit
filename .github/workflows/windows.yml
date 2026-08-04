@@ -110,85 +110,26 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 终极方案：PAT + curl 直接调 REST API
-      #    前提：已在 GitHub 网页上手动创建过一次 Release 以激活 Fork 仓库的 Releases 功能
-      - name: 发布到 Releases（独立 Release，保留历史）
+      # ✅ 回归 softprops/action-gh-release，更新已有的 latest-windows Release
+      #    tag_name: latest-windows → 固定 tag，每次构建都更新同一个 Release
+      #    target_commitish: BUILT_SHA → 确保 Release 指向实际编译的 commit
+      #    files → 替换附件
+      #    generate_release_notes: false → 避免 Discussions API 404
+      #    make_latest: true → 保持 Latest 标记
+      - name: 发布到 Releases（更新 latest-windows）
         if: github.event_name != 'pull_request'
-        env:
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          BUILT_SHA: ${{ env.BUILT_SHA }}
-          RUN_NUMBER: ${{ github.run_number }}
-          REPO: ${{ github.repository }}
-        shell: pwsh
-        run: |
-          $tag = "win-$env:RUN_NUMBER"
-          $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER"
-          $body = "Windows x64 静态构建（历史版本全部保留，可回滚）。`n实际编译 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
-
-          # 1) 创建 Release
-          $releaseBody = @{
-            tag_name         = $tag
-            target_commitish = $env:BUILT_SHA
-            name             = $title
-            body             = $body
-            draft            = $false
-            prerelease       = $false
-          } | ConvertTo-Json
-
-          $headers = @{
-            Authorization = "token $env:RELEASE_TOKEN"
-            Accept        = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
-          }
-
-          Write-Host "正在创建 Release: $tag ..."
-          try {
-            $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases" `
-              -Method Post `
-              -Headers $headers `
-              -Body ([System.Text.Encoding]::UTF8.GetBytes($releaseBody)) `
-              -ContentType "application/json; charset=utf-8"
-          } catch {
-            $statusCode = $_.Exception.Response.StatusCode.value__
-            $errorBody = ""
-            if ($_.Exception.Response) {
-              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-              $errorBody = $reader.ReadToEnd()
-            }
-            Write-Host "❌ 创建 Release 失败 (HTTP $statusCode): $errorBody"
-            throw "Release 创建失败，请确认：1) RELEASE_TOKEN Secret 已设置且未过期 2) 已在网页上手动创建过一次 Release 激活功能"
-          }
-
-          $uploadUrl = $response.upload_url -replace '\{.*\}', ''
-          Write-Host "✅ Release 创建成功: $($response.html_url)"
-
-          # 2) 上传附件
-          $filePath = "upload/ZLMediaKit-Windows-x64.zip"
-          $fileName = "ZLMediaKit-Windows-x64.zip"
-          $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
-
-          Write-Host "正在上传附件: $fileName ($([math]::Round($fileBytes.Length/1MB,2)) MB) ..."
-          try {
-            $uploadResponse = Invoke-RestMethod -Uri "$uploadUrl`?name=$fileName" `
-              -Method Post `
-              -Headers @{
-                Authorization = "token $env:RELEASE_TOKEN"
-                Accept        = "application/vnd.github+json"
-                "Content-Type" = "application/octet-stream"
-              } `
-              -Body $fileBytes
-          } catch {
-            $statusCode = $_.Exception.Response.StatusCode.value__
-            $errorBody = ""
-            if ($_.Exception.Response) {
-              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-              $errorBody = $reader.ReadToEnd()
-            }
-            Write-Host "❌ 上传附件失败 (HTTP $statusCode): $errorBody"
-            throw "附件上传失败"
-          }
-
-          Write-Host "✅ 附件上传成功: $($uploadResponse.browser_download_url)"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-windows
+          name: "ZLMediaKit Windows x64 最新构建"
+          body: |
+            自动滚动发布的 Windows x64 静态构建（每次成功构建自动替换）。
+            对应 commit: ${{ env.BUILT_SHA }}
+            包内含: MediaServer.exe / config.ini / default.pem / www(如有)
+          target_commitish: ${{ env.BUILT_SHA }}
+          files: upload/ZLMediaKit-Windows-x64.zip
+          generate_release_notes: false
+          make_latest: true
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
