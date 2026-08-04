@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 79d795a767da85bbba821b87d853d808
+          ref: 79d795a767da85bbba821b871265fd87d853d808
           submodules: recursive
 
       - name: 记录实际编译的 commit
@@ -110,24 +110,35 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
+      # ✅ 终极修复：放弃 softprops/action-gh-release，改用 GitHub CLI 直接调用 REST API
+      #    gh release create 只调用纯粹的 Releases API，不触碰 Discussions / Latest 等隐藏端点
+      #    彻底规避 softprops Action 在 Fork / 新仓库上的 404 问题
       - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
-        with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          tag_name: win-${{ github.run_number }}
-          name: "ZLMediaKit Windows x64 #${{ github.run_number }}"
-          target_commitish: ${{ env.BUILT_SHA }}
-          body: |
-            Windows x64 静态构建（历史版本全部保留，可回滚）。
-            实际编译 commit: ${{ env.BUILT_SHA }}
-            包内含: MediaServer.exe / config.ini / default.pem / www(如有)
-          files: upload/ZLMediaKit-Windows-x64.zip
-          make_latest: true
-          # ✅ 关键修复：显式设为 false，阻止 Action 调用 Discussions API
-          #    你的仓库未启用 Discussions，不调用此参数会导致 404
-          generate_release_notes: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILT_SHA: ${{ env.BUILT_SHA }}
+          RUN_NUMBER: ${{ github.run_number }}
+        shell: pwsh
+        run: |
+          $tag = "win-$env:RUN_NUMBER"
+          $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER"
+          $body = @"
+          Windows x64 静态构建（历史版本全部保留，可回滚）。
+          实际编译 commit: $env:BUILT_SHA
+          包内含: MediaServer.exe / config.ini / default.pem / www(如有)
+          "@
+
+          # 如果同名 tag 已存在则先删除（保证幂等）
+          gh release delete $tag --yes --cleanup-tag 2>$null
+
+          gh release create $tag `
+            --title $title `
+            --notes $body `
+            --target $env:BUILT_SHA `
+            upload/ZLMediaKit-Windows-x64.zip
+
+          Write-Host "✅ Release 创建成功: $tag"
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
