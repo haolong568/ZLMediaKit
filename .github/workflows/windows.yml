@@ -104,6 +104,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path upload | Out-Null
+          # ✅ 关键修复：打包前强制确保 dist 非空，规避 upload-artifact@v4 在 Windows 下的空目录 Bug
+          if (-not (Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue)) {
+            Write-Host "⚠ dist 为空，写入占位文件以绕过 Artifact 上传缺陷"
+            Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts were produced in this build."
+          }
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
@@ -122,11 +127,11 @@ jobs:
           files: upload/ZLMediaKit-Windows-x64.zip
           make_latest: true
 
-      - name: 打包二进制（Actions 产物备份）
+      - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
           path: dist/
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 90
