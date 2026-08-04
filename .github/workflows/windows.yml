@@ -110,10 +110,8 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 终极方案：使用 Personal Access Token (PAT) 而非 GITHUB_TOKEN
-      #    Fork 仓库的 GITHUB_TOKEN 被 GitHub 强制限制为只读，无法创建 Release
-      #    PAT 拥有完整的 repo 权限，不受 Fork 限制
-      #    使用 curl 直接调用 GitHub REST API，零第三方依赖，零隐藏调用
+      # ✅ 终极方案：PAT + curl 直接调 REST API
+      #    前提：已在 GitHub 网页上手动创建过一次 Release 以激活 Fork 仓库的 Releases 功能
       - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
         env:
@@ -127,7 +125,7 @@ jobs:
           $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER"
           $body = "Windows x64 静态构建（历史版本全部保留，可回滚）。`n实际编译 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
 
-          # 1) 创建 Release（纯 REST API，无任何隐藏调用）
+          # 1) 创建 Release
           $releaseBody = @{
             tag_name         = $tag
             target_commitish = $env:BUILT_SHA
@@ -144,11 +142,22 @@ jobs:
           }
 
           Write-Host "正在创建 Release: $tag ..."
-          $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases" `
-            -Method Post `
-            -Headers $headers `
-            -Body $releaseBody `
-            -ContentType "application/json"
+          try {
+            $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases" `
+              -Method Post `
+              -Headers $headers `
+              -Body ([System.Text.Encoding]::UTF8.GetBytes($releaseBody)) `
+              -ContentType "application/json; charset=utf-8"
+          } catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            $errorBody = ""
+            if ($_.Exception.Response) {
+              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+              $errorBody = $reader.ReadToEnd()
+            }
+            Write-Host "❌ 创建 Release 失败 (HTTP $statusCode): $errorBody"
+            throw "Release 创建失败，请确认：1) RELEASE_TOKEN Secret 已设置且未过期 2) 已在网页上手动创建过一次 Release 激活功能"
+          }
 
           $uploadUrl = $response.upload_url -replace '\{.*\}', ''
           Write-Host "✅ Release 创建成功: $($response.html_url)"
@@ -156,20 +165,28 @@ jobs:
           # 2) 上传附件
           $filePath = "upload/ZLMediaKit-Windows-x64.zip"
           $fileName = "ZLMediaKit-Windows-x64.zip"
-          $fileSize = (Get-Item $filePath).Length
+          $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
 
-          Write-Host "正在上传附件: $fileName ($([math]::Round($fileSize/1MB,2)) MB) ..."
-          $uploadHeaders = @{
-            Authorization = "token $env:RELEASE_TOKEN"
-            Accept        = "application/vnd.github+json"
-            "Content-Type" = "application/octet-stream"
-            "Content-Length" = $fileSize
+          Write-Host "正在上传附件: $fileName ($([math]::Round($fileBytes.Length/1MB,2)) MB) ..."
+          try {
+            $uploadResponse = Invoke-RestMethod -Uri "$uploadUrl`?name=$fileName" `
+              -Method Post `
+              -Headers @{
+                Authorization = "token $env:RELEASE_TOKEN"
+                Accept        = "application/vnd.github+json"
+                "Content-Type" = "application/octet-stream"
+              } `
+              -Body $fileBytes
+          } catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            $errorBody = ""
+            if ($_.Exception.Response) {
+              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+              $errorBody = $reader.ReadToEnd()
+            }
+            Write-Host "❌ 上传附件失败 (HTTP $statusCode): $errorBody"
+            throw "附件上传失败"
           }
-
-          $uploadResponse = Invoke-RestMethod -Uri "$uploadUrl`?name=$fileName" `
-            -Method Post `
-            -Headers $uploadHeaders `
-            -InFile $filePath
 
           Write-Host "✅ 附件上传成功: $($uploadResponse.browser_download_url)"
 
