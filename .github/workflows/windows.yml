@@ -1,3 +1,112 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 发布 Release 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 79d795a767da85bbba821b871265fd87d853d808
+          submodules: recursive
+
+      - name: 记录实际编译的 commit
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "BUILT_SHA=$(git rev-parse HEAD)"
+
+      - name: 安装 vcpkg 并编译依赖
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
+          cd ${{github.workspace}}/vcpkg
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          .\bootstrap-vcpkg.bat
+          .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
+
+      - name: CMake 配置
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: 编译 MediaServer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/server/MediaServer.vcxproj)) {
+            Get-ChildItem -Path build -Recurse -Filter *.vcxproj | Select-Object FullName
+            throw "未找到 build/server/MediaServer.vcxproj"
+          }
+          cmake --build build --config Release --target MediaServer --parallel 4
+
+      - name: 全工作区收集产物（exe + config + pem + www）
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # 1) 主程序
+          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
+          foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
+
+          # 2) 配置文件
+          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
+          }
+
+          # 3) default.pem：优先仓库自带，否则用 openssl 生成自签名证书
+          $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
+          if ($pem) {
+            Copy-Item $pem.FullName -Destination dist/default.pem -Force
+            Write-Host "收集证书: $($pem.FullName)"
+          } else {
+            Write-Host "仓库未自带 default.pem，尝试生成自签名证书..."
+            $opensslExe = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+            if (-not $opensslExe) {
+              $opensslExe = Get-ChildItem -Path "$ws/vcpkg/installed" -Recurse -Filter "openssl.exe" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1 -ExpandProperty FullName
+            }
+            if ($opensslExe) {
+              & $opensslExe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
+              Write-Host "已生成自签名 default.pem"
+            } else {
+              Write-Host "⚠ 未找到 openssl 工具，跳过证书生成（仅影响 https 端口）"
+            }
+          }
+
+          # 4) www 目录（旧版可能叫 web）
+          $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
+                 Select-Object -First 1
+          if ($www) {
+            Copy-Item $www.FullName -Destination dist/www -Recurse -Force
+            Write-Host "收集网页目录: $($www.FullName)"
+          } else {
+            Write-Host "⚠ 仓库中未发现 www/web 目录（不影响核心功能）"
+          }
+
+          Write-Host "=== dist 最终内容 ==="
+          Get-ChildItem dist | Select-Object Name
+
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path upload | Out-Null
+          Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
+          Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
+
       - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
@@ -14,20 +123,7 @@
           make_latest: true
 
       - name: 打包二进制（Actions 产物备份）
-        # ✅ 改用 shell 显式检查，彻底规避 hashFiles 在 Windows 下的兼容问题
-        shell: pwsh
-        run: |
-          $files = Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue
-          if ($files.Count -eq 0) {
-            Write-Host "⚠ dist 目录为空或不存在，跳过 Artifact 上传"
-            exit 0
-          }
-          Write-Host "✅ dist 目录下发现 $($files.Count) 个文件，准备上传 Artifact"
-          # 将检查结果写入环境变量供后续步骤使用
-          Add-Content -Path $env:GITHUB_ENV -Value "HAS_DIST_FILES=true"
-
-      - name: 上传 Artifact 备份
-        if: success() && env.HAS_DIST_FILES == 'true'
+        if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: Windows_${{ github.ref_name }}_${{ github.sha }}
