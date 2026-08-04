@@ -110,9 +110,11 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 终极修复：放弃 softprops/action-gh-release，改用 GitHub CLI 直接调用 REST API
-      #    gh release create 只调用纯粹的 Releases API，不触碰 Discussions / Latest 等隐藏端点
-      #    彻底规避 softprops Action 在 Fork / 新仓库上的 404 问题
+      # ✅ 终极修复：使用 GitHub CLI 直接调用 REST API，彻底规避 softprops Action 的所有隐藏调用
+      #    关键改动：
+      #    1. 删除操作加 try-catch 包裹，防止 403/404 导致脚本退出
+      #    2. 显式设置 $ErrorActionPreference = 'Continue'，避免非终止错误中断流程
+      #    3. 创建成功后显式输出成功信息，确保 exit code 为 0
       - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
         env:
@@ -121,6 +123,9 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
         shell: pwsh
         run: |
+          # ✅ 关键修复1：允许非终止错误继续执行，防止 gh delete 的 403 中断整个脚本
+          $ErrorActionPreference = 'Continue'
+
           $tag = "win-$env:RUN_NUMBER"
           $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER"
           $body = @"
@@ -129,14 +134,25 @@ jobs:
           包内含: MediaServer.exe / config.ini / default.pem / www(如有)
           "@
 
-          # 如果同名 tag 已存在则先删除（保证幂等）
-          gh release delete $tag --yes --cleanup-tag 2>$null
+          # ✅ 关键修复2：用 try-catch 包裹删除操作，无论成功失败都不影响后续创建
+          try {
+            gh release delete $tag --yes --cleanup-tag 2>&1 | Out-Null
+            Write-Host "ℹ️ 已清理旧 Release: $tag"
+          } catch {
+            Write-Host "ℹ️ 无旧 Release 需要清理（首次运行或已手动删除），继续创建..."
+          }
 
+          # ✅ 关键修复3：创建 Release，这是核心操作，必须成功
           gh release create $tag `
             --title $title `
             --notes $body `
             --target $env:BUILT_SHA `
             upload/ZLMediaKit-Windows-x64.zip
+
+          # ✅ 关键修复4：检查 gh 命令的实际退出码，而非依赖 PowerShell 的 $LASTEXITCODE 自动传播
+          if ($LASTEXITCODE -ne 0) {
+            throw "❌ gh release create 失败，退出码: $LASTEXITCODE"
+          }
 
           Write-Host "✅ Release 创建成功: $tag"
 
