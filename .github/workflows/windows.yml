@@ -52,18 +52,12 @@ jobs:
         run: |
           $ws = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-
-          # 1) 主程序
           $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
           if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
           foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
-
-          # 2) 配置文件
           @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
             if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
           }
-
-          # 3) default.pem：优先仓库自带，否则用 openssl 生成自签名证书
           $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
                  Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
           if ($pem) {
@@ -80,22 +74,15 @@ jobs:
               & $opensslExe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
               Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
               Write-Host "已生成自签名 default.pem"
-            } else {
-              Write-Host "⚠ 未找到 openssl 工具，跳过证书生成（仅影响 https 端口）"
-            }
+            } else { Write-Host "⚠ 未找到 openssl 工具，跳过证书生成" }
           }
-
-          # 4) www 目录（旧版可能叫 web）
           $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
                  Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
                  Select-Object -First 1
           if ($www) {
             Copy-Item $www.FullName -Destination dist/www -Recurse -Force
             Write-Host "收集网页目录: $($www.FullName)"
-          } else {
-            Write-Host "⚠ 仓库中未发现 www/web 目录（不影响核心功能）"
-          }
-
+          } else { Write-Host "⚠ 仓库中未发现 www/web 目录" }
           Write-Host "=== dist 最终内容 ==="
           Get-ChildItem dist | Select-Object Name
 
@@ -104,32 +91,56 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path upload | Out-Null
           if (-not (Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue)) {
-            Write-Host "⚠ dist 为空，写入占位文件以绕过 Artifact 上传缺陷"
-            Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts were produced in this build."
+            Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts."
           }
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 回归 softprops/action-gh-release，更新已有的 latest-windows Release
-      #    tag_name: latest-windows → 固定 tag，每次构建都更新同一个 Release
-      #    target_commitish: BUILT_SHA → 确保 Release 指向实际编译的 commit
-      #    files → 替换附件
-      #    generate_release_notes: false → 避免 Discussions API 404
-      #    make_latest: true → 保持 Latest 标记
+      # ✅ 终极方案：gh CLI + PAT + 显式错误处理
+      # 不使用任何第三方 Action，直接调用 GitHub CLI
+      # 通过 GH_TOKEN 环境变量注入 PAT，彻底绕过 GITHUB_TOKEN 的 Fork 限制
       - name: 发布到 Releases（更新 latest-windows）
         if: github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest-windows
-          name: "ZLMediaKit Windows x64 最新构建"
-          body: |
-            自动滚动发布的 Windows x64 静态构建（每次成功构建自动替换）。
-            对应 commit: ${{ env.BUILT_SHA }}
-            包内含: MediaServer.exe / config.ini / default.pem / www(如有)
-          target_commitish: ${{ env.BUILT_SHA }}
-          files: upload/ZLMediaKit-Windows-x64.zip
-          generate_release_notes: false
-          make_latest: true
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          BUILT_SHA: ${{ env.BUILT_SHA }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "latest-windows"
+          $title = "ZLMediaKit Windows x64 最新构建"
+          $body = "自动滚动发布的 Windows x64 静态构建。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
+          $asset = "upload/ZLMediaKit-Windows-x64.zip"
+
+          Write-Host "🔍 检查现有 Release: $tag"
+          $exists = gh release view $tag --json tagName 2>$null
+          
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "🔄 更新现有 Release..."
+            gh release edit $tag `
+              --title $title `
+              --notes $body `
+              --target $env:BUILT_SHA
+            
+            if ($LASTEXITCODE -ne 0) { throw "❌ 更新 Release 失败" }
+            
+            Write-Host "🗑️ 删除旧附件..."
+            gh release delete-asset $tag ZLMediaKit-Windows-x64.zip --yes 2>$null
+            
+            Write-Host "📤 上传新附件..."
+            gh release upload $tag $asset --clobber
+            if ($LASTEXITCODE -ne 0) { throw "❌ 上传附件失败" }
+          } else {
+            Write-Host "✨ 创建新 Release..."
+            gh release create $tag $asset `
+              --title $title `
+              --notes $body `
+              --target $env:BUILT_SHA `
+              --latest
+            if ($LASTEXITCODE -ne 0) { throw "❌ 创建 Release 失败" }
+          }
+          
+          Write-Host "✅ Release 发布成功: $tag → $env:BUILT_SHA"
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
