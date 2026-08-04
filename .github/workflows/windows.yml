@@ -110,51 +110,68 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 终极修复：使用 GitHub CLI 直接调用 REST API，彻底规避 softprops Action 的所有隐藏调用
-      #    关键改动：
-      #    1. 删除操作加 try-catch 包裹，防止 403/404 导致脚本退出
-      #    2. 显式设置 $ErrorActionPreference = 'Continue'，避免非终止错误中断流程
-      #    3. 创建成功后显式输出成功信息，确保 exit code 为 0
+      # ✅ 终极方案：使用 Personal Access Token (PAT) 而非 GITHUB_TOKEN
+      #    Fork 仓库的 GITHUB_TOKEN 被 GitHub 强制限制为只读，无法创建 Release
+      #    PAT 拥有完整的 repo 权限，不受 Fork 限制
+      #    使用 curl 直接调用 GitHub REST API，零第三方依赖，零隐藏调用
       - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
         env:
-          GH_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           BUILT_SHA: ${{ env.BUILT_SHA }}
           RUN_NUMBER: ${{ github.run_number }}
+          REPO: ${{ github.repository }}
         shell: pwsh
         run: |
-          # ✅ 关键修复1：允许非终止错误继续执行，防止 gh delete 的 403 中断整个脚本
-          $ErrorActionPreference = 'Continue'
-
           $tag = "win-$env:RUN_NUMBER"
           $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER"
-          $body = @"
-          Windows x64 静态构建（历史版本全部保留，可回滚）。
-          实际编译 commit: $env:BUILT_SHA
-          包内含: MediaServer.exe / config.ini / default.pem / www(如有)
-          "@
+          $body = "Windows x64 静态构建（历史版本全部保留，可回滚）。`n实际编译 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
 
-          # ✅ 关键修复2：用 try-catch 包裹删除操作，无论成功失败都不影响后续创建
-          try {
-            gh release delete $tag --yes --cleanup-tag 2>&1 | Out-Null
-            Write-Host "ℹ️ 已清理旧 Release: $tag"
-          } catch {
-            Write-Host "ℹ️ 无旧 Release 需要清理（首次运行或已手动删除），继续创建..."
+          # 1) 创建 Release（纯 REST API，无任何隐藏调用）
+          $releaseBody = @{
+            tag_name         = $tag
+            target_commitish = $env:BUILT_SHA
+            name             = $title
+            body             = $body
+            draft            = $false
+            prerelease       = $false
+          } | ConvertTo-Json
+
+          $headers = @{
+            Authorization = "token $env:RELEASE_TOKEN"
+            Accept        = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
           }
 
-          # ✅ 关键修复3：创建 Release，这是核心操作，必须成功
-          gh release create $tag `
-            --title $title `
-            --notes $body `
-            --target $env:BUILT_SHA `
-            upload/ZLMediaKit-Windows-x64.zip
+          Write-Host "正在创建 Release: $tag ..."
+          $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases" `
+            -Method Post `
+            -Headers $headers `
+            -Body $releaseBody `
+            -ContentType "application/json"
 
-          # ✅ 关键修复4：检查 gh 命令的实际退出码，而非依赖 PowerShell 的 $LASTEXITCODE 自动传播
-          if ($LASTEXITCODE -ne 0) {
-            throw "❌ gh release create 失败，退出码: $LASTEXITCODE"
+          $uploadUrl = $response.upload_url -replace '\{.*\}', ''
+          Write-Host "✅ Release 创建成功: $($response.html_url)"
+
+          # 2) 上传附件
+          $filePath = "upload/ZLMediaKit-Windows-x64.zip"
+          $fileName = "ZLMediaKit-Windows-x64.zip"
+          $fileSize = (Get-Item $filePath).Length
+
+          Write-Host "正在上传附件: $fileName ($([math]::Round($fileSize/1MB,2)) MB) ..."
+          $uploadHeaders = @{
+            Authorization = "token $env:RELEASE_TOKEN"
+            Accept        = "application/vnd.github+json"
+            "Content-Type" = "application/octet-stream"
+            "Content-Length" = $fileSize
           }
 
-          Write-Host "✅ Release 创建成功: $tag"
+          $uploadResponse = Invoke-RestMethod -Uri "$uploadUrl`?name=$fileName" `
+            -Method Post `
+            -Headers $uploadHeaders `
+            -InFile $filePath
+
+          Write-Host "✅ 附件上传成功: $($uploadResponse.browser_download_url)"
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
