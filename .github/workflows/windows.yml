@@ -5,7 +5,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# ✅ 显式声明写权限，确保内置 GITHUB_TOKEN 可以创建 Release
 permissions:
   contents: write
 
@@ -15,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 79d795a767da85bbba821b871265fd87d853d808
+          ref: 79d795a767da85bbba821b87d853d808
           submodules: recursive
 
       - name: 记录实际编译的 commit
@@ -104,7 +103,6 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path upload | Out-Null
-          # 兜底保障：确保 dist 永远非空
           if (-not (Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue)) {
             Write-Host "⚠ dist 为空，写入占位文件以绕过 Artifact 上传缺陷"
             Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts were produced in this build."
@@ -116,8 +114,6 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
-          # ✅ 直接使用内置 GITHUB_TOKEN，无需任何外部 Secret
-          #    配合顶部 permissions: contents: write，对当前仓库天然有创建 Release 的权限
           token: ${{ github.token }}
           repository: ${{ github.repository }}
           tag_name: win-${{ github.run_number }}
@@ -129,6 +125,9 @@ jobs:
             包内含: MediaServer.exe / config.ini / default.pem / www(如有)
           files: upload/ZLMediaKit-Windows-x64.zip
           make_latest: true
+          # ✅ 关键修复：显式设为 false，阻止 Action 调用 Discussions API
+          #    你的仓库未启用 Discussions，不调用此参数会导致 404
+          generate_release_notes: false
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
