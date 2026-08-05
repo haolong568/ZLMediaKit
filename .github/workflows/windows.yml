@@ -1,7 +1,7 @@
 name: Windows Full Build
 
 on:
-  # 🔒 仅在打 Tag 或手动触发时运行，彻底杜绝 push->release->push 死循环
+  # 🔒 防死循环：仅 Tag 和手动触发，push 到分支绝不触发 Release
   push:
     tags:
       - 'win-*'
@@ -41,7 +41,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "BUILT_SHA=$sha"
           Write-Host "📌 Building commit: $sha"
 
-      # 💾 缓存 vcpkg 二进制包，大幅加速后续构建
+      # 💾 vcpkg 缓存加速
       - name: Cache vcpkg packages
         uses: actions/cache@v4
         id: vcpkg-cache
@@ -63,7 +63,6 @@ jobs:
           git checkout $env:VCPKG_COMMIT
           .\bootstrap-vcpkg.bat -disableMetrics
           
-          # 如果缓存命中则跳过安装
           if ("${{ steps.vcpkg-cache.outputs.cache-hit }}" -ne "true") {
             Write-Host "⏳ Installing packages (no cache hit)..."
             .\vcpkg.exe install $env:VCPKG_PACKAGES.Split(' ') --triplet $env:TRIPLET
@@ -103,10 +102,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           
-          # 1. 复制主程序
+          # 1. 主程序
           Copy-Item build/server/MediaServer.exe -Destination dist/ -Force
           
-          # 2. 复制配置文件（按优先级）
+          # 2. 配置文件
           $configPaths = @("server/config.ini", "conf/config.ini", "config.ini")
           foreach ($p in $configPaths) {
             if (Test-Path $p) {
@@ -116,7 +115,7 @@ jobs:
             }
           }
           
-          # 3. 处理 SSL 证书
+          # 3. SSL 证书
           $pemSrc = Get-ChildItem -Path . -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
                     Where-Object { $_.FullName -notmatch '\\(vcpkg|build|\.git)\\' } |
                     Select-Object -First 1
@@ -139,7 +138,7 @@ jobs:
             }
           }
           
-          # 4. 复制 Web 资源
+          # 4. Web 资源
           $wwwDir = Get-ChildItem -Path . -Directory -Recurse -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\(vcpkg|build|\.git)\\' } |
                     Select-Object -First 1
@@ -159,10 +158,28 @@ jobs:
           $size = [math]::Round((Get-Item upload\ZLMediaKit-Windows-x64-Full.zip).Length / 1MB, 2)
           Write-Host "📦 Package size: ${size} MB"
 
+      # 🔑 关键修复：恢复 RELEASE_TOKEN + 增加权限预检
+      - name: Validate RELEASE_TOKEN
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:GH_TOKEN)) {
+            throw "❌ secrets.RELEASE_TOKEN is not configured! Please add it in Settings → Secrets → Actions"
+          }
+          $headers = @{ Authorization = "token $env:GH_TOKEN" }
+          try {
+            $repo = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}" -Headers $headers
+            Write-Host "✅ Token valid for repo: $($repo.full_name)"
+          } catch {
+            throw "❌ RELEASE_TOKEN invalid or lacks repo access: $_"
+          }
+
       - name: Publish to GitHub Releases
         if: startsWith(github.ref, 'refs/tags/')
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
@@ -181,13 +198,17 @@ jobs:
           - www/ (web resources if available)
           "@
           
+          Write-Host "🚀 Creating release: $tag"
           gh release create $tag `
             upload/ZLMediaKit-Windows-x64-Full.zip `
             --title $title `
             --notes $body `
             --latest
           
-          Write-Host "✅ Released: $tag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "❌ gh release create failed with exit code $LASTEXITCODE"
+          }
+          Write-Host "✅ Released successfully: $tag"
 
       - name: Upload Artifact (for non-tag builds)
         if: "!startsWith(github.ref, 'refs/tags/')"
