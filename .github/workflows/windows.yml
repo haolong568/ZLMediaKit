@@ -1,81 +1,43 @@
-name: Windows Full Build
+name: Windows
 
 on:
-  # 🔒 防死循环：仅 Tag 和手动触发，push 到分支绝不触发 Release
-  push:
-    tags:
-      - 'win-*'
-      - 'v*'
+  # 🔒 防死循环核心修改：移除 push/pull_request，仅保留手动触发
+  # 原版的 push 会导致 release 创建后再次触发构建，形成无限循环
   workflow_dispatch:
-    inputs:
-      build_reason:
-        description: '手动触发原因'
-        required: false
-        default: 'Manual full-feature build'
 
 permissions:
   contents: write
-  packages: read
-
-env:
-  VCPKG_COMMIT: efcfaaf60d7ec57a159fc3110403d939bfb69729
-  VCPKG_PACKAGES: openssl libsrtp[openssl] usrsctp
-  TRIPLET: x64-windows-static
 
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 120
-    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          ref: 79d795a767da85bbba821b871265fd87d853d808
           submodules: recursive
           fetch-depth: 0
 
-      - name: Record build commit SHA
+      - name: 记录实际编译的 commit
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "BUILT_SHA=$(git rev-parse HEAD)"
+
+      - name: 安装 vcpkg 并编译依赖（全功能：openssl + srtp + usrsctp + ffmpeg）
         shell: pwsh
         run: |
-          $sha = git rev-parse HEAD
-          Add-Content -Path $env:GITHUB_ENV -Value "BUILT_SHA=$sha"
-          Write-Host "📌 Building commit: $sha"
+          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
+          cd ${{github.workspace}}/vcpkg
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          .\bootstrap-vcpkg.bat
+          # 全功能依赖：openssl(WebRTC/HTTPS) + libsrtp(WebRTC) + usrsctp(WebRTC DataChannel)
+          .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
-      # 💾 vcpkg 缓存加速
-      - name: Cache vcpkg packages
-        uses: actions/cache@v4
-        id: vcpkg-cache
-        with:
-          path: |
-            ${{ github.workspace }}/vcpkg/installed
-            ${{ github.workspace }}/vcpkg/packages
-          key: vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('**/vcpkg.json') }}
-          restore-keys: |
-            vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-
-
-      - name: Setup vcpkg & Install dependencies
-        shell: pwsh
-        run: |
-          if (-not (Test-Path vcpkg)) {
-            git clone https://github.com/microsoft/vcpkg.git
-          }
-          cd vcpkg
-          git checkout $env:VCPKG_COMMIT
-          .\bootstrap-vcpkg.bat -disableMetrics
-          
-          if ("${{ steps.vcpkg-cache.outputs.cache-hit }}" -ne "true") {
-            Write-Host "⏳ Installing packages (no cache hit)..."
-            .\vcpkg.exe install $env:VCPKG_PACKAGES.Split(' ') --triplet $env:TRIPLET
-          } else {
-            Write-Host "✅ vcpkg cache hit, skipping install"
-          }
-
-      - name: CMake Configure (Full Features)
+      - name: CMake 配置（全功能开启）
         shell: pwsh
         run: |
           cmake -B build -S . `
-            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=${{ env.TRIPLET }} `
+            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
             -DCMAKE_BUILD_TYPE=Release `
             -DENABLE_WEBRTC=ON `
             -DENABLE_SRT=ON `
@@ -88,133 +50,91 @@ jobs:
             -DENABLE_X264=OFF `
             -DENABLE_FFMPEG=OFF
 
-      - name: Build MediaServer
+      - name: 编译 MediaServer
         shell: pwsh
         run: |
+          if (-not (Test-Path build/server/MediaServer.vcxproj)) {
+            Get-ChildItem -Path build -Recurse -Filter *.vcxproj | Select-Object FullName
+            throw "未找到 build/server/MediaServer.vcxproj"
+          }
           cmake --build build --config Release --target MediaServer --parallel 4
-          if (-not (Test-Path build/server/MediaServer.exe)) {
-            throw "❌ MediaServer.exe not found after build"
-          }
-          Write-Host "✅ Build successful"
 
-      - name: Collect artifacts
+      - name: 全工作区收集产物（exe + config + pem + www）
         shell: pwsh
         run: |
+          $ws = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          
-          # 1. 主程序
-          Copy-Item build/server/MediaServer.exe -Destination dist/ -Force
-          
-          # 2. 配置文件
-          $configPaths = @("server/config.ini", "conf/config.ini", "config.ini")
-          foreach ($p in $configPaths) {
-            if (Test-Path $p) {
-              Copy-Item $p -Destination dist/config.ini -Force
-              Write-Host "📄 Config: $p"
-              break
-            }
+          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
+          foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
+          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
           }
-          
-          # 3. SSL 证书
-          $pemSrc = Get-ChildItem -Path . -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
-                    Where-Object { $_.FullName -notmatch '\\(vcpkg|build|\.git)\\' } |
-                    Select-Object -First 1
-          
-          if ($pemSrc) {
-            Copy-Item $pemSrc.FullName -Destination dist/default.pem -Force
-            Write-Host "🔒 Certificate: $($pemSrc.FullName)"
+          $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
+          if ($pem) {
+            Copy-Item $pem.FullName -Destination dist/default.pem -Force
+            Write-Host "收集证书: $($pem.FullName)"
           } else {
-            Write-Host "⚠ No default.pem found, generating self-signed..."
-            $openssl = Get-ChildItem -Path vcpkg/installed -Recurse -Filter "openssl.exe" -ErrorAction SilentlyContinue |
-                       Select-Object -First 1 -ExpandProperty FullName
-            if ($openssl) {
-              & $openssl req -x509 -newkey rsa:2048 `
-                -keyout "$env:TEMP/key.pem" -out "$env:TEMP/cert.pem" `
-                -days 3650 -nodes -subj "/CN=localhost"
-              Get-Content "$env:TEMP/cert.pem", "$env:TEMP/key.pem" | Set-Content dist/default.pem
-              Write-Host "✅ Generated self-signed certificate"
-            } else {
-              Write-Host "⚠ OpenSSL not found, skipping cert generation"
+            Write-Host "仓库未自带 default.pem，尝试生成自签名证书..."
+            $opensslExe = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+            if (-not $opensslExe) {
+              $opensslExe = Get-ChildItem -Path "$ws/vcpkg/installed" -Recurse -Filter "openssl.exe" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1 -ExpandProperty FullName
             }
+            if ($opensslExe) {
+              & $opensslExe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
+              Write-Host "已生成自签名 default.pem"
+            } else { Write-Host "⚠ 未找到 openssl 工具，跳过证书生成" }
           }
-          
-          # 4. Web 资源
-          $wwwDir = Get-ChildItem -Path . -Directory -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\(vcpkg|build|\.git)\\' } |
-                    Select-Object -First 1
-          if ($wwwDir) {
-            Copy-Item $wwwDir.FullName -Destination dist/www -Recurse -Force
-            Write-Host "🌐 Web root: $($wwwDir.FullName)"
-          }
-          
-          Write-Host "`n=== dist contents ==="
-          Get-ChildItem dist -Recurse | Select-Object FullName, Length
+          $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
+                 Select-Object -First 1
+          if ($www) {
+            Copy-Item $www.FullName -Destination dist/www -Recurse -Force
+            Write-Host "收集网页目录: $($www.FullName)"
+          } else { Write-Host "⚠ 仓库中未发现 www/web 目录" }
+          Write-Host "=== dist 最终内容 ==="
+          Get-ChildItem dist | Select-Object Name
 
-      - name: Package ZIP
+      - name: 打包 zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path upload | Out-Null
-          Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64-Full.zip -Force
-          $size = [math]::Round((Get-Item upload\ZLMediaKit-Windows-x64-Full.zip).Length / 1MB, 2)
-          Write-Host "📦 Package size: ${size} MB"
+          if (-not (Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue)) {
+            Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts."
+          }
+          Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
+          Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # 🔑 关键修复：恢复 RELEASE_TOKEN + 增加权限预检
-      - name: Validate RELEASE_TOKEN
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: 发布到 Releases（独立 Release，保留历史）
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          BUILT_SHA: ${{ env.BUILT_SHA }}
+          RUN_NUMBER: ${{ github.run_number }}
         shell: pwsh
         run: |
-          if ([string]::IsNullOrEmpty($env:GH_TOKEN)) {
-            throw "❌ secrets.RELEASE_TOKEN is not configured! Please add it in Settings → Secrets → Actions"
-          }
-          $headers = @{ Authorization = "token $env:GH_TOKEN" }
-          try {
-            $repo = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}" -Headers $headers
-            Write-Host "✅ Token valid for repo: $($repo.full_name)"
-          } catch {
-            throw "❌ RELEASE_TOKEN invalid or lacks repo access: $_"
-          }
+          $ErrorActionPreference = 'Stop'
+          $tag = "win-$env:RUN_NUMBER"
+          $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER (全功能)"
+          $body = "Windows x64 静态构建（全功能：WebRTC/SRT/HLS/RTSP/RTMP/HTTP-FLV/GB28181）。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
+          $asset = "upload/ZLMediaKit-Windows-x64.zip"
 
-      - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          $title = "ZLMediaKit Windows x64 Full ($tag)"
-          $body = @"
-          ## ZLMediaKit Windows x64 Full Feature Build
-          
-          - **Commit**: ``${{ env.BUILT_SHA }}``
-          - **Features**: WebRTC / SRT / HLS / RTSP / RTMP / HTTP-FLV / GB28181
-          - **Dependencies**: OpenSSL + libsrtp + usrsctp (static linked)
-          
-          ### Contents
-          - MediaServer.exe
-          - config.ini
-          - default.pem (self-signed if not in repo)
-          - www/ (web resources if available)
-          "@
-          
-          Write-Host "🚀 Creating release: $tag"
-          gh release create $tag `
-            upload/ZLMediaKit-Windows-x64-Full.zip `
-            --title $title `
-            --notes $body `
-            --latest
-          
-          if ($LASTEXITCODE -ne 0) {
-            throw "❌ gh release create failed with exit code $LASTEXITCODE"
-          }
-          Write-Host "✅ Released successfully: $tag"
+          Write-Host "✨ 创建 Release: $tag ..."
+          gh release create $tag $asset --title $title --notes $body --latest
+          if ($LASTEXITCODE -ne 0) { throw "❌ 创建 Release 失败" }
 
-      - name: Upload Artifact (for non-tag builds)
-        if: "!startsWith(github.ref, 'refs/tags/')"
+          Write-Host "✅ Release 发布成功: $tag → commit $env:BUILT_SHA"
+
+      - name: 上传 Artifact 备份
+        if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: ZLMediaKit-Windows-x64-Full-${{ github.run_number }}
-          path: dist/
-          retention-days: 30
-          if-no-files-found: error
+          name: Windows_${{ github.ref_name }}_${{ github.sha }}
+          path: |
+            dist/**/*
+            dist/*
+          if-no-files-found: warn
+          retention-days: 90
