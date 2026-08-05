@@ -97,43 +97,24 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-      # ✅ 修复：不传 --target 参数（commit SHA 可能不在 Fork 仓库中，导致 PATCH 404）
-      #    commit 信息写在 Release body 里，用户一眼就能看到
-      #    使用 PAT 认证，绕过 GITHUB_TOKEN 的 Fork 限制
-      - name: 发布到 Releases（更新 latest-windows）
+      # ✅ 每次构建创建独立 Release，版本号自动递增，保留全部历史
+      - name: 发布到 Releases（独立 Release，保留历史）
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           BUILT_SHA: ${{ env.BUILT_SHA }}
+          RUN_NUMBER: ${{ github.run_number }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = "latest-windows"
-          $title = "ZLMediaKit Windows x64 最新构建"
-          $body = "自动滚动发布的 Windows x64 静态构建（每次成功构建自动替换）。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
+          $tag = "win-$env:RUN_NUMBER"
+          $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER"
+          $body = "Windows x64 静态构建（历史版本全部保留，可回滚）。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
           $asset = "upload/ZLMediaKit-Windows-x64.zip"
 
-          Write-Host "🔍 检查现有 Release: $tag"
-          $exists = gh release view $tag --json tagName 2>$null
-
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "🔄 更新现有 Release..."
-            # ⚠️ 关键修复：不传 --target，避免 404
-            gh release edit $tag --title $title --notes $body
-            if ($LASTEXITCODE -ne 0) { throw "❌ 更新 Release 失败" }
-
-            Write-Host "🗑️ 删除旧附件..."
-            gh release delete-asset $tag ZLMediaKit-Windows-x64.zip --yes 2>$null
-
-            Write-Host "📤 上传新附件..."
-            gh release upload $tag $asset --clobber
-            if ($LASTEXITCODE -ne 0) { throw "❌ 上传附件失败" }
-          } else {
-            Write-Host "✨ 创建新 Release..."
-            # 创建时也不传 --target
-            gh release create $tag $asset --title $title --notes $body --latest
-            if ($LASTEXITCODE -ne 0) { throw "❌ 创建 Release 失败" }
-          }
+          Write-Host "✨ 创建 Release: $tag ..."
+          gh release create $tag $asset --title $title --notes $body --latest
+          if ($LASTEXITCODE -ne 0) { throw "❌ 创建 Release 失败" }
 
           Write-Host "✅ Release 发布成功: $tag → commit $env:BUILT_SHA"
 
