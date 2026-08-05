@@ -1,9 +1,15 @@
 name: Windows
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/windows.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - '.github/workflows/windows.yml'
 
 permissions:
   contents: write
