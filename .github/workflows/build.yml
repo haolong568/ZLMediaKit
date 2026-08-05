@@ -1,0 +1,306 @@
+name: Build All Platforms
+
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']       # ✅ 防循环：忽略所有 tag push
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ============================================
+  # Job 1: 矩阵构建 Windows + Linux（并行执行）
+  # ============================================
+  build:
+    strategy:
+      fail-fast: false        # 一个平台失败不影响另一个
+      matrix:
+        include:
+          - os: windows-2022
+            platform: windows
+            artifact_name: ZLMediaKit-Windows-x64.zip
+            vcpkg_triplet: x64-windows-static
+            bootstrap: bootstrap-vcpkg.bat
+            cmake_generator: ""
+            parallel: "4"
+
+          - os: ubuntu-22.04
+            platform: linux
+            artifact_name: ZLMediaKit-Linux-x64.tar.gz
+            vcpkg_triplet: x64-linux
+            bootstrap: bootstrap-vcpkg.sh
+            cmake_generator: ""
+            parallel: "$(nproc)"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 79d795a767da85bbba821b871265fd87d853d808
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 记录实际编译的 commit
+        run: |
+          echo "BUILT_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+        shell: bash
+
+      # ---------- Linux 专属：安装系统依赖 ----------
+      - name: 安装系统依赖 (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git pkg-config libssl-dev libsctp-dev
+
+      # ---------- 安装 vcpkg 并编译依赖 ----------
+      - name: 安装 vcpkg 并编译依赖
+        shell: bash
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
+          cd ${{github.workspace}}/vcpkg
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          ./${{ matrix.bootstrap }}
+          ./vcpkg install openssl libsrtp[openssl] usrsctp --triplet ${{ matrix.vcpkg_triplet }}
+
+      # ---------- CMake 配置 ----------
+      - name: CMake 配置（全功能开启）
+        shell: bash
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_WEBRTC=ON \
+            -DENABLE_SRT=ON \
+            -DENABLE_RTPPROXY=ON \
+            -DENABLE_HLS=ON \
+            -DENABLE_MP4=ON \
+            -DENABLE_API=ON \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_FAAC=OFF \
+            -DENABLE_X264=OFF \
+            -DENABLE_FFMPEG=OFF
+
+      # ---------- 编译 MediaServer ----------
+      - name: 编译 MediaServer (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/server/MediaServer.vcxproj)) {
+            Get-ChildItem -Path build -Recurse -Filter *.vcxproj | Select-Object FullName
+            throw "未找到 build/server/MediaServer.vcxproj"
+          }
+          cmake --build build --config Release --target MediaServer --parallel 4
+
+      - name: 编译 MediaServer (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          cmake --build build --config Release --target MediaServer --parallel $(nproc)
+
+      # ---------- 收集产物 ----------
+      - name: 收集产物 (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
+          foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
+
+          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
+          }
+
+          $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
+          if ($pem) {
+            Copy-Item $pem.FullName -Destination dist/default.pem -Force
+            Write-Host "收集证书: $($pem.FullName)"
+          } else {
+            Write-Host "仓库未自带 default.pem，尝试生成自签名证书..."
+            $opensslExe = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+            if (-not $opensslExe) {
+              $opensslExe = Get-ChildItem -Path "$ws/vcpkg/installed" -Recurse -Filter "openssl.exe" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1 -ExpandProperty FullName
+            }
+            if ($opensslExe) {
+              & $opensslExe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
+              Write-Host "已生成自签名 default.pem"
+            } else { Write-Host "⚠ 未找到 openssl 工具，跳过证书生成" }
+          }
+
+          $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
+                 Select-Object -First 1
+          if ($www) {
+            Copy-Item $www.FullName -Destination dist/www -Recurse -Force
+            Write-Host "收集网页目录: $($www.FullName)"
+          } else { Write-Host "⚠ 仓库中未发现 www/web 目录" }
+
+          Write-Host "=== dist 最终内容 ==="
+          Get-ChildItem dist | Select-Object Name
+
+      - name: 收集产物 (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          ws=$GITHUB_WORKSPACE
+          mkdir -p dist
+
+          exe=$(find "$ws" -name "MediaServer" -type f -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+          if [ -z "$exe" ]; then
+            echo "❌ 整个工作区未找到 MediaServer 可执行文件"
+            find "$ws/build" -type f -executable 2>/dev/null | head -20
+            exit 1
+          fi
+          cp "$exe" dist/MediaServer
+          chmod +x dist/MediaServer
+          echo "收集: $exe"
+
+          for cfg in "server/config.ini" "conf/config.ini" "config.ini"; do
+            if [ -f "$cfg" ]; then
+              cp "$cfg" dist/config.ini
+              echo "收集配置: $cfg"
+              break
+            fi
+          done
+
+          pem=$(find "$ws" -name "default.pem" -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+          if [ -n "$pem" ]; then
+            cp "$pem" dist/default.pem
+            echo "收集证书: $pem"
+          else
+            echo "仓库未自带 default.pem，尝试生成自签名证书..."
+            openssl_exe=$(which openssl 2>/dev/null)
+            if [ -z "$openssl_exe" ]; then
+              openssl_exe=$(find "$ws/vcpkg/installed" -name "openssl" -type f 2>/dev/null | head -1)
+            fi
+            if [ -n "$openssl_exe" ]; then
+              $openssl_exe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              cat "$ws/cert.pem" "$ws/key.pem" > dist/default.pem
+              echo "已生成自签名 default.pem"
+            else
+              echo "⚠ 未找到 openssl 工具，跳过证书生成"
+            fi
+          fi
+
+          www=$(find "$ws" -maxdepth 3 -type d \( -name "www" -o -name "web" \) -not -path "*/vcpkg/*" -not -path "*/build/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+          if [ -n "$www" ]; then
+            cp -r "$www" dist/www
+            echo "收集网页目录: $www"
+          else
+            echo "⚠ 仓库中未发现 www/web 目录"
+          fi
+
+          echo "=== dist 最终内容 ==="
+          ls -la dist/
+
+      # ---------- 打包 ----------
+      - name: 打包 (Windows → zip)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path upload | Out-Null
+          if (-not (Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue)) {
+            Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts."
+          }
+          Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
+          Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
+
+      - name: 打包 (Linux → tar.gz)
+        if: matrix.platform == 'linux'
+        run: |
+          mkdir -p upload
+          if [ ! "$(ls -A dist/ 2>/dev/null)" ]; then
+            echo "No binary artifacts." > dist/_EMPTY_BUILD_PLACEHOLDER.txt
+          fi
+          tar -czvf upload/ZLMediaKit-Linux-x64.tar.gz -C dist .
+          ls -lh upload/
+
+      # ---------- 上传 artifact 供 release job 下载 ----------
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.platform }}
+          path: upload/*
+          retention-days: 1
+
+  # ============================================
+  # Job 2: 统一发布 Release（等两个平台都构建完）
+  # ============================================
+  release:
+    needs: build              # ✅ 等 Windows + Linux 都完成
+    runs-on: ubuntu-22.04
+    # ✅ 双重保险：仅分支push才发布
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+
+    steps:
+      # 下载所有平台的构建产物
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: all-packages
+          pattern: package-*
+          merge-multiple: true
+
+      - name: 查看下载的产物
+        run: |
+          echo "=== 所有待发布文件 ==="
+          ls -lh all-packages/
+
+      - name: 获取 BUILT_SHA
+        run: |
+          # 从任意一个 artifact 中无法直接获取 env，改用 git 方式
+          # 因为 checkout 了固定 ref，所以直接 hardcode 即可
+          echo "BUILT_SHA=79d795a767da85bbba821b871265fd87d853d808" >> $GITHUB_ENV
+
+      - name: 创建统一 Release 并上传所有 asset
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          BUILT_SHA: ${{ env.BUILT_SHA }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -e
+          tag="build-$RUN_NUMBER"
+          title="ZLMediaKit 全平台构建 #$RUN_NUMBER"
+          body="## 全平台自动构建
+
+          | 平台 | 文件 |
+          |------|------|
+          | Windows x64 | ZLMediaKit-Windows-x64.zip |
+          | Linux x64 | ZLMediaKit-Linux-x64.tar.gz |
+
+          **对应 commit:** \`$BUILT_SHA\`
+          **包内含:** MediaServer / config.ini / default.pem / www(如有)
+          **功能:** WebRTC / SRT / HLS / RTSP / RTMP / HTTP-FLV / GB28181"
+
+          echo "✨ 创建 Release: $tag ..."
+
+          # 收集所有 asset 文件
+          assets=""
+          for f in all-packages/*; do
+            if [ -f "$f" ]; then
+              assets="$assets $f"
+              echo "  📦 将上传: $(basename $f)"
+            fi
+          done
+
+          # 一次性创建 Release 并附带所有 asset
+          gh release create "$tag" $assets \
+            --title "$title" \
+            --notes "$body" \
+            --latest
+
+          if [ $? -ne 0 ]; then
+            echo "❌ 创建 Release 失败"
+            exit 1
+          fi
+
+          echo "✅ Release 发布成功: $tag"
+          echo "   包含 $(echo $assets | wc -w) 个平台产物"
