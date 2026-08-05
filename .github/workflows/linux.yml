@@ -2,6 +2,8 @@ name: Linux
 
 on:
   push:
+    branches: ['**']       # ✅ 仅监听分支push，tag push不触发（防循环核心）
+    tags-ignore: ['**']    # ✅ 显式忽略所有tag，彻底切断tag→workflow链路
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
+      # ↓↓↓ checkout 与原版完全一致，一字未动 ↓↓↓
       - uses: actions/checkout@v4
         with:
           ref: 79d795a767da85bbba821b871265fd87d853d808
@@ -21,21 +24,26 @@ jobs:
       - name: 记录实际编译的 commit
         run: echo "BUILT_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
-      - name: 安装系统依赖（全功能）
+      - name: 安装系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake git pkg-config \
-            libssl-dev \
-            libsrtp2-dev \
-            libsctp-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
-            ffmpeg \
-            zlib1g-dev
+            libssl-dev libsctp-dev
+
+      - name: 安装 vcpkg 并编译依赖（全功能：openssl + srtp + usrsctp）
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
+          cd ${{github.workspace}}/vcpkg
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          ./bootstrap-vcpkg.sh
+          ./vcpkg install openssl libsrtp[openssl] usrsctp --triplet x64-linux
 
       - name: CMake 配置（全功能开启）
         run: |
           cmake -B build -S . \
+            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_WEBRTC=ON \
             -DENABLE_SRT=ON \
@@ -46,87 +54,107 @@ jobs:
             -DENABLE_TESTS=OFF \
             -DENABLE_FAAC=OFF \
             -DENABLE_X264=OFF \
-            -DENABLE_FFMPEG=ON
+            -DENABLE_FFMPEG=OFF
 
       - name: 编译 MediaServer
-        run: cmake --build build --config Release --target MediaServer --parallel $(nproc)
-
-      - name: 收集产物（二进制 + config + pem + www）
         run: |
+          if [ ! -f build/server/MediaServer ]; then
+            echo "=== 查找可执行文件 ==="
+            find build -name "MediaServer" -type f 2>/dev/null || true
+            # 先尝试 make，如果 vcxproj 不存在是正常的（Linux 用 Makefile/Ninja）
+          fi
+          cmake --build build --config Release --target MediaServer --parallel $(nproc)
+
+      - name: 全工作区收集产物（可执行文件 + config + pem + www）
+        run: |
+          ws=$GITHUB_WORKSPACE
           mkdir -p dist
 
-          # 1) 主程序
-          EXE=$(find . -name "MediaServer" -type f -executable ! -path "*/vcpkg/*" ! -path "*/.git/*" | head -1)
-          if [ -z "$EXE" ]; then
-            echo "❌ 未找到 MediaServer 可执行文件"
-            find . -name "MediaServer*" -type f | head -20
+          # 收集可执行文件
+          exe=$(find "$ws" -name "MediaServer" -type f -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+          if [ -z "$exe" ]; then
+            echo "❌ 整个工作区未找到 MediaServer 可执行文件"
+            find "$ws/build" -type f -executable 2>/dev/null | head -20
             exit 1
           fi
-          cp "$EXE" dist/MediaServer
+          cp "$exe" dist/MediaServer
           chmod +x dist/MediaServer
-          echo "收集: $EXE"
+          echo "收集: $exe"
 
-          # 2) 配置文件
-          for f in server/config.ini conf/config.ini config.ini; do
-            if [ -f "$f" ]; then
-              cp "$f" dist/config.ini
-              echo "收集配置: $f"
+          # 收集配置文件
+          for cfg in "server/config.ini" "conf/config.ini" "config.ini"; do
+            if [ -f "$cfg" ]; then
+              cp "$cfg" dist/config.ini
+              echo "收集配置: $cfg"
               break
             fi
           done
 
-          # 3) default.pem
-          PEM=$(find . -name "default.pem" -type f ! -path "*/vcpkg/*" ! -path "*/.git/*" | head -1)
-          if [ -n "$PEM" ]; then
-            cp "$PEM" dist/default.pem
-            echo "收集证书: $PEM"
+          # 收集证书
+          pem=$(find "$ws" -name "default.pem" -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+          if [ -n "$pem" ]; then
+            cp "$pem" dist/default.pem
+            echo "收集证书: $pem"
           else
-            echo "仓库未自带 default.pem，生成自签名证书..."
-            openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -subj "/CN=localhost"
-            cat cert.pem key.pem > dist/default.pem
-            echo "已生成自签名 default.pem"
+            echo "仓库未自带 default.pem，尝试生成自签名证书..."
+            openssl_exe=$(which openssl 2>/dev/null)
+            if [ -z "$openssl_exe" ]; then
+              openssl_exe=$(find "$ws/vcpkg/installed" -name "openssl" -type f 2>/dev/null | head -1)
+            fi
+            if [ -n "$openssl_exe" ]; then
+              $openssl_exe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              cat "$ws/cert.pem" "$ws/key.pem" > dist/default.pem
+              echo "已生成自签名 default.pem"
+            else
+              echo "⚠ 未找到 openssl 工具，跳过证书生成"
+            fi
           fi
 
-          # 4) www 目录
-          WWW_DIR=$(find . -maxdepth 3 -type d \( -name "www" -o -name "web" \) ! -path "*/vcpkg/*" ! -path "*/build/*" ! -path "*/.git/*" | head -1)
-          if [ -n "$WWW_DIR" ]; then
-            cp -r "$WWW_DIR" dist/www
-            echo "收集网页目录: $WWW_DIR"
+          # 收集网页目录
+          www=$(find "$ws" -maxdepth 3 -type d \( -name "www" -o -name "web" \) -not -path "*/vcpkg/*" -not -path "*/build/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+          if [ -n "$www" ]; then
+            cp -r "$www" dist/www
+            echo "收集网页目录: $www"
           else
             echo "⚠ 仓库中未发现 www/web 目录"
           fi
 
           echo "=== dist 最终内容 ==="
-          ls -lh dist/
+          ls -la dist/
 
       - name: 打包 tar.gz
         run: |
           mkdir -p upload
-          if [ ! "$(ls -A dist/)" ]; then
+          if [ ! "$(ls -A dist/ 2>/dev/null)" ]; then
             echo "No binary artifacts." > dist/_EMPTY_BUILD_PLACEHOLDER.txt
           fi
-          tar -czf upload/ZLMediaKit-Linux-x64.tar.gz -C dist .
+          tar -czvf upload/ZLMediaKit-Linux-x64.tar.gz -C dist .
           ls -lh upload/
 
       - name: 发布到 Releases（独立 Release，保留历史）
-        if: github.event_name != 'pull_request'
+        # ✅ 双重保险：仅分支push才发布，tag push绝不进入此步骤
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           BUILT_SHA: ${{ env.BUILT_SHA }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -e
-          TAG="linux-$RUN_NUMBER"
-          TITLE="ZLMediaKit Linux x64 #$RUN_NUMBER (全功能)"
-          BODY="Linux x64 构建（全功能：WebRTC/SRT/HLS/RTSP/RTMP/HTTP-FLV/GB28181/FFmpeg转码）。
+          tag="linux-$RUN_NUMBER"
+          title="ZLMediaKit Linux x64 #$RUN_NUMBER (全功能)"
+          body="Linux x64 静态构建（全功能：WebRTC/SRT/HLS/RTSP/RTMP/HTTP-FLV/GB28181）。
           对应 commit: $BUILT_SHA
-          包内含: MediaServer / config.ini / default.pem / www(如有)
-          运行方式: chmod +x MediaServer && ./MediaServer -c config.ini"
-          ASSET="upload/ZLMediaKit-Linux-x64.tar.gz"
+          包内含: MediaServer / config.ini / default.pem / www(如有)"
+          asset="upload/ZLMediaKit-Linux-x64.tar.gz"
 
-          echo "✨ 创建 Release: $TAG ..."
-          gh release create "$TAG" "$ASSET" --title "$TITLE" --notes "$BODY" --latest
-          echo "✅ Release 发布成功: $TAG → commit $BUILT_SHA"
+          echo "✨ 创建 Release: $tag ..."
+          gh release create "$tag" "$asset" --title "$title" --notes "$body" --latest
+          if [ $? -ne 0 ]; then
+            echo "❌ 创建 Release 失败"
+            exit 1
+          fi
+
+          echo "✅ Release 发布成功: $tag → commit $BUILT_SHA"
 
       - name: 上传 Artifact 备份
         if: success() && github.event_name != 'pull_request'
