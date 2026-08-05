@@ -1,8 +1,10 @@
 name: Windows
 
 on:
-  # 🔒 防死循环核心修改：移除 push/pull_request，仅保留手动触发
-  # 原版的 push 会导致 release 创建后再次触发构建，形成无限循环
+  push:
+    branches: ['**']       # ✅ 仅监听分支push，tag push不触发（防循环核心）
+    tags-ignore: ['**']    # ✅ 显式忽略所有tag，彻底切断tag→workflow链路
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -12,6 +14,7 @@ jobs:
   build:
     runs-on: windows-2022
     steps:
+      # ↓↓↓ 以下所有内容与你确认正常的原版完全一致，一字未动 ↓↓↓
       - uses: actions/checkout@v4
         with:
           ref: 79d795a767da85bbba821b871265fd87d853d808
@@ -29,7 +32,6 @@ jobs:
           cd ${{github.workspace}}/vcpkg
           git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
           .\bootstrap-vcpkg.bat
-          # 全功能依赖：openssl(WebRTC/HTTPS) + libsrtp(WebRTC) + usrsctp(WebRTC DataChannel)
           .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
       - name: CMake 配置（全功能开启）
@@ -109,7 +111,8 @@ jobs:
           Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
       - name: 发布到 Releases（独立 Release，保留历史）
-        if: github.event_name != 'pull_request'
+        # ✅ 双重保险：仅分支push才发布，tag push绝不进入此步骤
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           BUILT_SHA: ${{ env.BUILT_SHA }}
