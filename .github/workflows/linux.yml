@@ -1,135 +1,140 @@
-name: Linux
+name: Windows
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
-
-    runs-on: ubuntu-24.04
-
+    runs-on: windows-2022
     steps:
-    - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
+        with:
+          ref: 79d795a767da85bbba821b871265fd87d853d808
+          submodules: recursive
+          fetch-depth: 0
 
-    - name: 下载submodule源码
-      run: mv -f .gitmodules_github .gitmodules && git submodule sync && git submodule update --init
+      - name: 记录实际编译的 commit
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "BUILT_SHA=$(git rev-parse HEAD)"
 
-    - name: 下载 SRTP
-      uses: actions/checkout@v2
-      with:
-        repository: cisco/libsrtp
-        fetch-depth: 1
-        ref: v2.3.0
-        path: 3rdpart/libsrtp
+      - name: 安装 vcpkg 并编译依赖（全功能：openssl + srtp + usrsctp + ffmpeg）
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
+          cd ${{github.workspace}}/vcpkg
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          .\bootstrap-vcpkg.bat
+          # 全功能依赖：openssl(WebRTC/HTTPS) + libsrtp(WebRTC) + usrsctp(WebRTC DataChannel)
+          .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet x64-windows-static
 
-    - name: 下载 openssl
-      uses: actions/checkout@v2
-      with:
-        repository: openssl/openssl
-        fetch-depth: 1
-        ref: OpenSSL_1_1_1
-        path: 3rdpart/openssl
+      - name: CMake 配置（全功能开启）
+        shell: pwsh
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DENABLE_WEBRTC=ON `
+            -DENABLE_SRT=ON `
+            -DENABLE_RTPPROXY=ON `
+            -DENABLE_HLS=ON `
+            -DENABLE_MP4=ON `
+            -DENABLE_API=ON `
+            -DENABLE_TESTS=OFF `
+            -DENABLE_FAAC=OFF `
+            -DENABLE_X264=OFF `
+            -DENABLE_FFMPEG=OFF
 
-    - name: 下载 usrsctp
-      uses: actions/checkout@v2
-      with:
-        repository: sctplab/usrsctp
-        fetch-depth: 1
-        ref: 0.9.5.0
-        path: 3rdpart/usrsctp
+      - name: 编译 MediaServer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build/server/MediaServer.vcxproj)) {
+            Get-ChildItem -Path build -Recurse -Filter *.vcxproj | Select-Object FullName
+            throw "未找到 build/server/MediaServer.vcxproj"
+          }
+          cmake --build build --config Release --target MediaServer --parallel 4
 
-    - name: 启动 Docker 容器, 在Docker 容器中执行脚本
-      run: |
-        docker pull centos:7 
-        docker run -v $(pwd):/root -w /root --rm centos:7 sh -c "
-          #!/bin/bash
-          set -x
-      
-          # Backup original CentOS-Base.repo file
-          cp /etc/yum.repos.d/CentOS-Base.repo /etc/yum.repos.d/CentOS-Base.repo.backup
-      
-          # Define new repository configuration
-          cat <<EOF > /etc/yum.repos.d/CentOS-Base.repo
-        [base]
-        name=CentOS-7 - Base - mirrors.aliyun.com
-        baseurl=http://mirrors.aliyun.com/centos/7/os/x86_64/
-        gpgcheck=1
-        gpgkey=http://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
-      
-        [updates]
-        name=CentOS-7 - Updates - mirrors.aliyun.com
-        baseurl=http://mirrors.aliyun.com/centos/7/updates/x86_64/
-        gpgcheck=1
-        gpgkey=http://mirrors.aliyun.com/centos/RPM-GPG-KEY-CentOS-7
-        EOF
-      
-          # Clean yum cache and recreate it
-          yum clean all
-          yum makecache
-      
-          echo \"CentOS 7 软件源已成功切换\"
-          yum install -y git wget gcc gcc-c++ make
-        
-          mkdir -p /root/install
-          
-          cd 3rdpart/openssl
-          ./config no-shared --prefix=/root/install
-          make -j $(nproc)
-          make install
-          cd ../../
-        
-          wget https://github.com/Kitware/CMake/releases/download/v3.29.5/cmake-3.29.5.tar.gz
-          tar -xf cmake-3.29.5.tar.gz
-          cd cmake-3.29.5
-          OPENSSL_ROOT_DIR=/root/install ./configure
-          make -j $(nproc)
-          make install
-          cd ..
-        
-          cd 3rdpart/usrsctp
-          mkdir build
-          cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON ..
-          make -j $(nproc)
-          make install
-          cd ../../../
-        
-          cd 3rdpart/libsrtp && ./configure --enable-openssl  --with-openssl-dir=/root/install && make -j $(nproc) && make install
-          cd ../../
-        
-          mkdir -p linux_build && cd linux_build && cmake .. -DOPENSSL_ROOT_DIR=/root/install -DCMAKE_BUILD_TYPE=Release && make -j $(nproc)
-        "
+      - name: 全工作区收集产物（exe + config + pem + www）
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
+          foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
+          @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
+            if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
+          }
+          $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
+          if ($pem) {
+            Copy-Item $pem.FullName -Destination dist/default.pem -Force
+            Write-Host "收集证书: $($pem.FullName)"
+          } else {
+            Write-Host "仓库未自带 default.pem，尝试生成自签名证书..."
+            $opensslExe = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+            if (-not $opensslExe) {
+              $opensslExe = Get-ChildItem -Path "$ws/vcpkg/installed" -Recurse -Filter "openssl.exe" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1 -ExpandProperty FullName
+            }
+            if ($opensslExe) {
+              & $opensslExe req -x509 -newkey rsa:2048 -keyout "$ws/key.pem" -out "$ws/cert.pem" -days 3650 -nodes -subj "/CN=localhost"
+              Get-Content "$ws/cert.pem", "$ws/key.pem" | Set-Content dist/default.pem
+              Write-Host "已生成自签名 default.pem"
+            } else { Write-Host "⚠ 未找到 openssl 工具，跳过证书生成" }
+          }
+          $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
+                 Select-Object -First 1
+          if ($www) {
+            Copy-Item $www.FullName -Destination dist/www -Recurse -Force
+            Write-Host "收集网页目录: $($www.FullName)"
+          } else { Write-Host "⚠ 仓库中未发现 www/web 目录" }
+          Write-Host "=== dist 最终内容 ==="
+          Get-ChildItem dist | Select-Object Name
 
-    - name: 设置环境变量
-      run: |
-        echo "BRANCH=$(echo ${GITHUB_REF#refs/heads/} | tr -s "/\?%*:|\"<>" "_")" >> $GITHUB_ENV  
-        echo "BRANCH2=$(echo ${GITHUB_REF#refs/heads/} )" >> $GITHUB_ENV    
-        echo "DATE=$(date +%Y-%m-%d)" >> $GITHUB_ENV
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path upload | Out-Null
+          if (-not (Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue)) {
+            Set-Content -Path dist/_EMPTY_BUILD_PLACEHOLDER.txt -Value "No binary artifacts."
+          }
+          Compress-Archive -Path dist\* -DestinationPath upload\ZLMediaKit-Windows-x64.zip
+          Get-ChildItem upload | Select-Object Name, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
-    - name: 打包二进制
-      id: upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ github.workflow }}_${{ env.BRANCH }}_${{ env.DATE }}
-        path: release/*
-        if-no-files-found: error
-        retention-days: 90
+      - name: 发布到 Releases（独立 Release，保留历史）
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          BUILT_SHA: ${{ env.BUILT_SHA }}
+          RUN_NUMBER: ${{ github.run_number }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "win-$env:RUN_NUMBER"
+          $title = "ZLMediaKit Windows x64 #$env:RUN_NUMBER (全功能)"
+          $body = "Windows x64 静态构建（全功能：WebRTC/SRT/HLS/RTSP/RTMP/HTTP-FLV/GB28181）。`n对应 commit: $env:BUILT_SHA`n包内含: MediaServer.exe / config.ini / default.pem / www(如有)"
+          $asset = "upload/ZLMediaKit-Windows-x64.zip"
 
-    - name: issue评论
-      if: github.event_name != 'pull_request' && github.ref != 'refs/heads/feature/test'
-      uses: actions/github-script@v7
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        script: |
-          github.rest.issues.createComment({
-            issue_number: ${{vars.VERSION_ISSUE_NO}},
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: '- 下载地址: [${{ github.workflow }}_${{ env.BRANCH }}_${{ env.DATE }}](${{ steps.upload.outputs.artifact-url }})\n'
-              + '- 分支: ${{ env.BRANCH2 }}\n' 
-              + '- git hash: ${{ github.sha }} \n' 
-              + '- 编译日期: ${{ env.DATE }}\n' 
-              + '- 编译记录: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n'
-              + '- 打包ci名: ${{ github.workflow }}\n'
-              + '- 开启特性: openssl/webrtc/datachannel\n'
-              + '- 说明: 本二进制在centos7(x64)上编译，请确保您的机器系统不低于此版本\n' 
-          })
+          Write-Host "✨ 创建 Release: $tag ..."
+          gh release create $tag $asset --title $title --notes $body --latest
+          if ($LASTEXITCODE -ne 0) { throw "❌ 创建 Release 失败" }
+
+          Write-Host "✅ Release 发布成功: $tag → commit $env:BUILT_SHA"
+
+      - name: 上传 Artifact 备份
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows_${{ github.ref_name }}_${{ github.sha }}
+          path: |
+            dist/**/*
+            dist/*
+          if-no-files-found: warn
+          retention-days: 90
