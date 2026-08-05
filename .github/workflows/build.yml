@@ -3,20 +3,63 @@ name: Build All Platforms
 on:
   push:
     branches: ['**']
-    tags-ignore: ['**']       # ✅ 防循环：忽略所有 tag push
+    tags-ignore: ['**']
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write          # ✅ 需要这个权限才能取消其他 workflow run
 
 jobs:
+  # ============================================
+  # Job 0: 取消同一次 push 触发的其他所有 workflow
+  # ============================================
+  cancel-others:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取消其他 workflow runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "当前 workflow run ID: ${{ github.run_id }}"
+          echo "当前 commit SHA: ${{ github.sha }}"
+          echo ""
+          echo "正在查找同一 commit 触发的其他 workflow runs..."
+
+          # 获取同一 commit 的所有 workflow runs
+          runs=$(gh api \
+            "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&per_page=100" \
+            --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | "\(.id) \(.name) \(.status)"')
+
+          if [ -z "$runs" ]; then
+            echo "✅ 没有其他 workflow runs 需要取消"
+          else
+            echo "发现以下 workflow runs 将被取消:"
+            echo "$runs"
+            echo ""
+
+            # 逐个取消
+            echo "$runs" | while read -r run_id run_name run_status; do
+              if [ "$run_status" = "queued" ] || [ "$run_status" = "in_progress" ]; then
+                echo "🚫 取消: $run_name (ID: $run_id, 状态: $run_status)"
+                gh api \
+                  "repos/${{ github.repository }}/actions/runs/$run_id/cancel" \
+                  --method POST || true
+              fi
+            done
+
+            echo ""
+            echo "✅ 已取消所有其他 workflow runs"
+          fi
+
   # ============================================
   # Job 1: 矩阵构建 Windows + Linux（并行执行）
   # ============================================
   build:
+    needs: cancel-others    # ✅ 等取消完成后再开始构建
     strategy:
-      fail-fast: false        # 一个平台失败不影响另一个
+      fail-fast: false
       matrix:
         include:
           - os: windows-2022
@@ -24,16 +67,12 @@ jobs:
             artifact_name: ZLMediaKit-Windows-x64.zip
             vcpkg_triplet: x64-windows-static
             bootstrap: bootstrap-vcpkg.bat
-            cmake_generator: ""
-            parallel: "4"
 
           - os: ubuntu-22.04
             platform: linux
             artifact_name: ZLMediaKit-Linux-x64.tar.gz
             vcpkg_triplet: x64-linux
             bootstrap: bootstrap-vcpkg.sh
-            cmake_generator: ""
-            parallel: "$(nproc)"
 
     runs-on: ${{ matrix.os }}
 
@@ -45,18 +84,15 @@ jobs:
           fetch-depth: 0
 
       - name: 记录实际编译的 commit
-        run: |
-          echo "BUILT_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+        run: echo "BUILT_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
         shell: bash
 
-      # ---------- Linux 专属：安装系统依赖 ----------
       - name: 安装系统依赖 (Linux)
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git pkg-config libssl-dev libsctp-dev
 
-      # ---------- 安装 vcpkg 并编译依赖 ----------
       - name: 安装 vcpkg 并编译依赖
         shell: bash
         run: |
@@ -66,7 +102,6 @@ jobs:
           ./${{ matrix.bootstrap }}
           ./vcpkg install openssl libsrtp[openssl] usrsctp --triplet ${{ matrix.vcpkg_triplet }}
 
-      # ---------- CMake 配置 ----------
       - name: CMake 配置（全功能开启）
         shell: bash
         run: |
@@ -85,7 +120,6 @@ jobs:
             -DENABLE_X264=OFF \
             -DENABLE_FFMPEG=OFF
 
-      # ---------- 编译 MediaServer ----------
       - name: 编译 MediaServer (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -101,22 +135,18 @@ jobs:
         run: |
           cmake --build build --config Release --target MediaServer --parallel $(nproc)
 
-      # ---------- 收集产物 ----------
       - name: 收集产物 (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $ws = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-
           $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
           if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
           foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
-
           @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
             if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
           }
-
           $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
                  Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
           if ($pem) {
@@ -135,7 +165,6 @@ jobs:
               Write-Host "已生成自签名 default.pem"
             } else { Write-Host "⚠ 未找到 openssl 工具，跳过证书生成" }
           }
-
           $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
                  Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
                  Select-Object -First 1
@@ -143,7 +172,6 @@ jobs:
             Copy-Item $www.FullName -Destination dist/www -Recurse -Force
             Write-Host "收集网页目录: $($www.FullName)"
           } else { Write-Host "⚠ 仓库中未发现 www/web 目录" }
-
           Write-Host "=== dist 最终内容 ==="
           Get-ChildItem dist | Select-Object Name
 
@@ -152,7 +180,6 @@ jobs:
         run: |
           ws=$GITHUB_WORKSPACE
           mkdir -p dist
-
           exe=$(find "$ws" -name "MediaServer" -type f -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
           if [ -z "$exe" ]; then
             echo "❌ 整个工作区未找到 MediaServer 可执行文件"
@@ -162,7 +189,6 @@ jobs:
           cp "$exe" dist/MediaServer
           chmod +x dist/MediaServer
           echo "收集: $exe"
-
           for cfg in "server/config.ini" "conf/config.ini" "config.ini"; do
             if [ -f "$cfg" ]; then
               cp "$cfg" dist/config.ini
@@ -170,7 +196,6 @@ jobs:
               break
             fi
           done
-
           pem=$(find "$ws" -name "default.pem" -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
           if [ -n "$pem" ]; then
             cp "$pem" dist/default.pem
@@ -189,7 +214,6 @@ jobs:
               echo "⚠ 未找到 openssl 工具，跳过证书生成"
             fi
           fi
-
           www=$(find "$ws" -maxdepth 3 -type d \( -name "www" -o -name "web" \) -not -path "*/vcpkg/*" -not -path "*/build/*" -not -path "*/.git/*" 2>/dev/null | head -1)
           if [ -n "$www" ]; then
             cp -r "$www" dist/www
@@ -197,11 +221,9 @@ jobs:
           else
             echo "⚠ 仓库中未发现 www/web 目录"
           fi
-
           echo "=== dist 最终内容 ==="
           ls -la dist/
 
-      # ---------- 打包 ----------
       - name: 打包 (Windows → zip)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -223,7 +245,6 @@ jobs:
           tar -czvf upload/ZLMediaKit-Linux-x64.tar.gz -C dist .
           ls -lh upload/
 
-      # ---------- 上传 artifact 供 release job 下载 ----------
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -232,16 +253,14 @@ jobs:
           retention-days: 1
 
   # ============================================
-  # Job 2: 统一发布 Release（等两个平台都构建完）
+  # Job 2: 统一发布 Release
   # ============================================
   release:
-    needs: build              # ✅ 等 Windows + Linux 都完成
+    needs: build
     runs-on: ubuntu-22.04
-    # ✅ 双重保险：仅分支push才发布
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
 
     steps:
-      # 下载所有平台的构建产物
       - name: 下载所有构建产物
         uses: actions/download-artifact@v4
         with:
@@ -254,16 +273,9 @@ jobs:
           echo "=== 所有待发布文件 ==="
           ls -lh all-packages/
 
-      - name: 获取 BUILT_SHA
-        run: |
-          # 从任意一个 artifact 中无法直接获取 env，改用 git 方式
-          # 因为 checkout 了固定 ref，所以直接 hardcode 即可
-          echo "BUILT_SHA=79d795a767da85bbba821b871265fd87d853d808" >> $GITHUB_ENV
-
       - name: 创建统一 Release 并上传所有 asset
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          BUILT_SHA: ${{ env.BUILT_SHA }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -e
@@ -276,13 +288,12 @@ jobs:
           | Windows x64 | ZLMediaKit-Windows-x64.zip |
           | Linux x64 | ZLMediaKit-Linux-x64.tar.gz |
 
-          **对应 commit:** \`$BUILT_SHA\`
+          **对应 commit:** \`79d795a767da85bbba821b871265fd87d853d808\`
           **包内含:** MediaServer / config.ini / default.pem / www(如有)
           **功能:** WebRTC / SRT / HLS / RTSP / RTMP / HTTP-FLV / GB28181"
 
           echo "✨ 创建 Release: $tag ..."
 
-          # 收集所有 asset 文件
           assets=""
           for f in all-packages/*; do
             if [ -f "$f" ]; then
@@ -291,16 +302,9 @@ jobs:
             fi
           done
 
-          # 一次性创建 Release 并附带所有 asset
           gh release create "$tag" $assets \
             --title "$title" \
             --notes "$body" \
             --latest
 
-          if [ $? -ne 0 ]; then
-            echo "❌ 创建 Release 失败"
-            exit 1
-          fi
-
           echo "✅ Release 发布成功: $tag"
-          echo "   包含 $(echo $assets | wc -w) 个平台产物"
