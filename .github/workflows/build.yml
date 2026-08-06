@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: write
-  actions: write          # ✅ 需要这个权限才能取消其他 workflow run
+  actions: write
 
 jobs:
   # ============================================
@@ -27,7 +27,6 @@ jobs:
           echo ""
           echo "正在查找同一 commit 触发的其他 workflow runs..."
 
-          # 获取同一 commit 的所有 workflow runs
           runs=$(gh api \
             "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&per_page=100" \
             --jq '.workflow_runs[] | select(.id != ${{ github.run_id }}) | "\(.id) \(.name) \(.status)"')
@@ -39,7 +38,6 @@ jobs:
             echo "$runs"
             echo ""
 
-            # 逐个取消
             echo "$runs" | while read -r run_id run_name run_status; do
               if [ "$run_status" = "queued" ] || [ "$run_status" = "in_progress" ]; then
                 echo "🚫 取消: $run_name (ID: $run_id, 状态: $run_status)"
@@ -57,7 +55,7 @@ jobs:
   # Job 1: 矩阵构建 Windows + Linux（并行执行）
   # ============================================
   build:
-    needs: cancel-others    # ✅ 等取消完成后再开始构建
+    needs: cancel-others
     strategy:
       fail-fast: false
       matrix:
@@ -93,20 +91,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git pkg-config libssl-dev libsctp-dev
 
-      - name: 安装 vcpkg 并编译依赖
+      # =============================================
+      # 🔧 修复1: Windows 用 pwsh，Linux 用 bash
+      #    分开写，避免 bash 在 Windows 上路径出错
+      # =============================================
+      - name: 安装 vcpkg 并编译依赖 (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $vcpkgDir = Join-Path $env:GITHUB_WORKSPACE "vcpkg"
+          git clone https://github.com/microsoft/vcpkg.git $vcpkgDir
+          Set-Location $vcpkgDir
+          git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
+          .\bootstrap-vcpkg.bat
+          .\vcpkg.exe install openssl libsrtp[openssl] usrsctp --triplet ${{ matrix.vcpkg_triplet }}
+
+      - name: 安装 vcpkg 并编译依赖 (Linux)
+        if: matrix.platform == 'linux'
         shell: bash
         run: |
-          git clone https://github.com/microsoft/vcpkg.git ${{github.workspace}}/vcpkg
-          cd ${{github.workspace}}/vcpkg
+          VCPKG_DIR="${GITHUB_WORKSPACE}/vcpkg"
+          git clone https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+          cd "$VCPKG_DIR"
           git checkout efcfaaf60d7ec57a159fc3110403d939bfb69729
-          ./${{ matrix.bootstrap }}
+          ./bootstrap-vcpkg.sh
           ./vcpkg install openssl libsrtp[openssl] usrsctp --triplet ${{ matrix.vcpkg_triplet }}
 
       - name: CMake 配置（全功能开启）
         shell: bash
         run: |
+          # 🔧 修复2: 用正斜杠路径，兼容 Windows bash
+          VCPKG_ROOT=$(echo "${{ github.workspace }}" | sed 's|\\|/|g')
           cmake -B build -S . \
-            -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.vcpkg_triplet }} \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_WEBRTC=ON \
@@ -135,20 +152,43 @@ jobs:
         run: |
           cmake --build build --config Release --target MediaServer --parallel $(nproc)
 
+      # =============================================
+      # 🔧 修复3: 收集产物 - 扩大搜索范围
+      #    ZLMediaKit 编译产物可能在多个位置
+      # =============================================
       - name: 收集产物 (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $ws = $env:GITHUB_WORKSPACE
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue
-          if (-not $exe) { throw "整个工作区未找到 MediaServer.exe" }
-          foreach ($f in @($exe)) { Copy-Item $f.FullName -Destination dist -Force; Write-Host "收集: $($f.FullName)" }
+
+          Write-Host "=== 搜索 MediaServer.exe ==="
+          $exe = Get-ChildItem -Path $ws -Recurse -Filter "MediaServer.exe" -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\|\\\.git\\' }
+          if ($exe) {
+            foreach ($f in $exe) {
+              Write-Host "找到: $($f.FullName) ($([math]::Round($f.Length/1MB,2)) MB)"
+            }
+            # 取第一个找到的
+            Copy-Item $exe[0].FullName -Destination dist/MediaServer.exe -Force
+            Write-Host "✅ 已收集 MediaServer.exe"
+          } else {
+            Write-Host "❌ 未找到 MediaServer.exe，列出所有 .exe 文件:"
+            Get-ChildItem -Path $ws -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\vcpkg\\|\\\.git\\' } |
+              Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
+            throw "未找到 MediaServer.exe"
+          }
+
+          # 收集配置文件
           @("server/config.ini", "conf/config.ini", "config.ini") | ForEach-Object {
             if (Test-Path $_) { Copy-Item $_ -Destination dist/config.ini -Force; Write-Host "收集配置: $_" }
           }
+
+          # 收集证书
           $pem = Get-ChildItem -Path $ws -Recurse -Filter "default.pem" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.FullName -notmatch '\\vcpkg\\' } | Select-Object -First 1
+                 Where-Object { $_.FullName -notmatch '\\vcpkg\\|\\\.git\\' } | Select-Object -First 1
           if ($pem) {
             Copy-Item $pem.FullName -Destination dist/default.pem -Force
             Write-Host "收集证书: $($pem.FullName)"
@@ -165,30 +205,70 @@ jobs:
               Write-Host "已生成自签名 default.pem"
             } else { Write-Host "⚠ 未找到 openssl 工具，跳过证书生成" }
           }
+
+          # 收集网页目录
           $www = Get-ChildItem -Path $ws -Recurse -Directory -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\.git\\' } |
+                 Where-Object { $_.Name -in @('www','web') -and $_.FullName -notmatch '\\vcpkg\\|\\build\\|\\\.git\\' } |
                  Select-Object -First 1
           if ($www) {
             Copy-Item $www.FullName -Destination dist/www -Recurse -Force
             Write-Host "收集网页目录: $($www.FullName)"
           } else { Write-Host "⚠ 仓库中未发现 www/web 目录" }
+
           Write-Host "=== dist 最终内容 ==="
-          Get-ChildItem dist | Select-Object Name
+          Get-ChildItem dist -Recurse | Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
       - name: 收集产物 (Linux)
         if: matrix.platform == 'linux'
         run: |
           ws=$GITHUB_WORKSPACE
           mkdir -p dist
-          exe=$(find "$ws" -name "MediaServer" -type f -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
+
+          echo "=== 搜索 MediaServer 可执行文件 ==="
+          # 🔧 扩大搜索范围：搜索所有可能的名称和位置
+          exe=""
+          for pattern in "MediaServer" "media_server" "zlmediakit"; do
+            found=$(find "$ws" -name "$pattern" -type f -executable \
+              -not -path "*/vcpkg/*" -not -path "*/.git/*" -not -path "*/CMakeFiles/*" 2>/dev/null | head -1)
+            if [ -n "$found" ]; then
+              exe="$found"
+              break
+            fi
+          done
+
+          # 如果还没找到，搜索 build 目录下所有可执行文件
           if [ -z "$exe" ]; then
-            echo "❌ 整个工作区未找到 MediaServer 可执行文件"
-            find "$ws/build" -type f -executable 2>/dev/null | head -20
+            echo "按名称未找到，搜索 build 目录下所有可执行文件:"
+            find "$ws/build" -type f -executable -not -path "*/CMakeFiles/*" 2>/dev/null | while read f; do
+              size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+              if [ "$size" -gt 1000000 ]; then
+                echo "  候选: $f ($(echo "scale=2; $size/1048576" | bc) MB)"
+                if [ -z "$exe" ]; then exe="$f"; fi
+              fi
+            done
+            # 重新赋值（子shell问题）
+            exe=$(find "$ws/build" -type f -executable -not -path "*/CMakeFiles/*" -size +1M 2>/dev/null | head -1)
+          fi
+
+          # 也检查 release 目录（ZLMediaKit 默认输出位置）
+          if [ -z "$exe" ]; then
+            exe=$(find "$ws/release" -type f -executable -size +1M 2>/dev/null | head -1)
+          fi
+
+          if [ -n "$exe" ]; then
+            echo "✅ 找到: $exe ($(du -h "$exe" | cut -f1))"
+            cp "$exe" dist/MediaServer
+            chmod +x dist/MediaServer
+          else
+            echo "❌ 未找到可执行文件，列出 build 目录结构:"
+            find "$ws/build" -maxdepth 3 -type f 2>/dev/null | head -50
+            echo ""
+            echo "列出 release 目录:"
+            find "$ws/release" -maxdepth 3 -type f 2>/dev/null | head -50
             exit 1
           fi
-          cp "$exe" dist/MediaServer
-          chmod +x dist/MediaServer
-          echo "收集: $exe"
+
+          # 收集配置文件
           for cfg in "server/config.ini" "conf/config.ini" "config.ini"; do
             if [ -f "$cfg" ]; then
               cp "$cfg" dist/config.ini
@@ -196,6 +276,8 @@ jobs:
               break
             fi
           done
+
+          # 收集证书
           pem=$(find "$ws" -name "default.pem" -not -path "*/vcpkg/*" -not -path "*/.git/*" 2>/dev/null | head -1)
           if [ -n "$pem" ]; then
             cp "$pem" dist/default.pem
@@ -214,6 +296,8 @@ jobs:
               echo "⚠ 未找到 openssl 工具，跳过证书生成"
             fi
           fi
+
+          # 收集网页目录
           www=$(find "$ws" -maxdepth 3 -type d \( -name "www" -o -name "web" \) -not -path "*/vcpkg/*" -not -path "*/build/*" -not -path "*/.git/*" 2>/dev/null | head -1)
           if [ -n "$www" ]; then
             cp -r "$www" dist/www
@@ -221,8 +305,9 @@ jobs:
           else
             echo "⚠ 仓库中未发现 www/web 目录"
           fi
+
           echo "=== dist 最终内容 ==="
-          ls -la dist/
+          ls -lhR dist/
 
       - name: 打包 (Windows → zip)
         if: matrix.platform == 'windows'
