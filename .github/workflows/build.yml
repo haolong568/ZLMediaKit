@@ -91,10 +91,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git pkg-config libssl-dev libsctp-dev
 
-      # =============================================
-      # 🔧 修复1: Windows 用 pwsh，Linux 用 bash
-      #    分开写，避免 bash 在 Windows 上路径出错
-      # =============================================
+      # ------------------------------------------
+      # vcpkg 安装（Windows 用 pwsh，Linux 用 bash）
+      # ------------------------------------------
       - name: 安装 vcpkg 并编译依赖 (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -117,10 +116,12 @@ jobs:
           ./bootstrap-vcpkg.sh
           ./vcpkg install openssl libsrtp[openssl] usrsctp --triplet ${{ matrix.vcpkg_triplet }}
 
+      # ------------------------------------------
+      # CMake 配置
+      # ------------------------------------------
       - name: CMake 配置（全功能开启）
         shell: bash
         run: |
-          # 🔧 修复2: 用正斜杠路径，兼容 Windows bash
           VCPKG_ROOT=$(echo "${{ github.workspace }}" | sed 's|\\|/|g')
           cmake -B build -S . \
             -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/vcpkg/scripts/buildsystems/vcpkg.cmake" \
@@ -137,6 +138,9 @@ jobs:
             -DENABLE_X264=OFF \
             -DENABLE_FFMPEG=OFF
 
+      # ------------------------------------------
+      # 编译
+      # ------------------------------------------
       - name: 编译 MediaServer (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -152,10 +156,9 @@ jobs:
         run: |
           cmake --build build --config Release --target MediaServer --parallel $(nproc)
 
-      # =============================================
-      # 🔧 修复3: 收集产物 - 扩大搜索范围
-      #    ZLMediaKit 编译产物可能在多个位置
-      # =============================================
+      # ------------------------------------------
+      # 收集产物 (Windows)
+      # ------------------------------------------
       - name: 收集产物 (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -170,7 +173,6 @@ jobs:
             foreach ($f in $exe) {
               Write-Host "找到: $($f.FullName) ($([math]::Round($f.Length/1MB,2)) MB)"
             }
-            # 取第一个找到的
             Copy-Item $exe[0].FullName -Destination dist/MediaServer.exe -Force
             Write-Host "✅ 已收集 MediaServer.exe"
           } else {
@@ -218,6 +220,9 @@ jobs:
           Write-Host "=== dist 最终内容 ==="
           Get-ChildItem dist -Recurse | Select-Object FullName, @{N='Size(MB)';E={[math]::Round($_.Length/1MB,2)}}
 
+      # ------------------------------------------
+      # 收集产物 (Linux)
+      # ------------------------------------------
       - name: 收集产物 (Linux)
         if: matrix.platform == 'linux'
         run: |
@@ -225,8 +230,9 @@ jobs:
           mkdir -p dist
 
           echo "=== 搜索 MediaServer 可执行文件 ==="
-          # 🔧 扩大搜索范围：搜索所有可能的名称和位置
           exe=""
+
+          # 第一轮：按名称精确搜索
           for pattern in "MediaServer" "media_server" "zlmediakit"; do
             found=$(find "$ws" -name "$pattern" -type f -executable \
               -not -path "*/vcpkg/*" -not -path "*/.git/*" -not -path "*/CMakeFiles/*" 2>/dev/null | head -1)
@@ -236,21 +242,13 @@ jobs:
             fi
           done
 
-          # 如果还没找到，搜索 build 目录下所有可执行文件
+          # 第二轮：搜索 build 目录下大于 1MB 的可执行文件
           if [ -z "$exe" ]; then
-            echo "按名称未找到，搜索 build 目录下所有可执行文件:"
-            find "$ws/build" -type f -executable -not -path "*/CMakeFiles/*" 2>/dev/null | while read f; do
-              size=$(stat -c%s "$f" 2>/dev/null || echo 0)
-              if [ "$size" -gt 1000000 ]; then
-                echo "  候选: $f ($(echo "scale=2; $size/1048576" | bc) MB)"
-                if [ -z "$exe" ]; then exe="$f"; fi
-              fi
-            done
-            # 重新赋值（子shell问题）
+            echo "按名称未找到，搜索 build 目录下所有大型可执行文件:"
             exe=$(find "$ws/build" -type f -executable -not -path "*/CMakeFiles/*" -size +1M 2>/dev/null | head -1)
           fi
 
-          # 也检查 release 目录（ZLMediaKit 默认输出位置）
+          # 第三轮：检查 release 目录
           if [ -z "$exe" ]; then
             exe=$(find "$ws/release" -type f -executable -size +1M 2>/dev/null | head -1)
           fi
@@ -260,10 +258,11 @@ jobs:
             cp "$exe" dist/MediaServer
             chmod +x dist/MediaServer
           else
-            echo "❌ 未找到可执行文件，列出 build 目录结构:"
+            echo "❌ 未找到可执行文件"
+            echo "=== build 目录结构 ==="
             find "$ws/build" -maxdepth 3 -type f 2>/dev/null | head -50
             echo ""
-            echo "列出 release 目录:"
+            echo "=== release 目录 ==="
             find "$ws/release" -maxdepth 3 -type f 2>/dev/null | head -50
             exit 1
           fi
@@ -309,6 +308,9 @@ jobs:
           echo "=== dist 最终内容 ==="
           ls -lhR dist/
 
+      # ------------------------------------------
+      # 打包
+      # ------------------------------------------
       - name: 打包 (Windows → zip)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -330,6 +332,9 @@ jobs:
           tar -czvf upload/ZLMediaKit-Linux-x64.tar.gz -C dist .
           ls -lh upload/
 
+      # ------------------------------------------
+      # 上传产物
+      # ------------------------------------------
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
@@ -346,6 +351,12 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
 
     steps:
+      # 🔧 必须 checkout，否则 gh 命令找不到 git 仓库
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: 下载所有构建产物
         uses: actions/download-artifact@v4
         with:
@@ -362,6 +373,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           RUN_NUMBER: ${{ github.run_number }}
+          REPO: ${{ github.repository }}
         run: |
           set -e
           tag="build-$RUN_NUMBER"
@@ -388,6 +400,7 @@ jobs:
           done
 
           gh release create "$tag" $assets \
+            --repo "$REPO" \
             --title "$title" \
             --notes "$body" \
             --latest
